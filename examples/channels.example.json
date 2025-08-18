@@ -1,0 +1,41 @@
+{
+  "twitch_channels": [
+    {
+      "login": "example_streamer",
+      "display_name": "Example Streamer",
+      "added_by": "Admin#1234",
+      "added_at": "2024-01-01T12:00:00Z"
+    },
+    {
+      "login": "another_streamer",
+      "display_name": "Another Streamer",
+      "added_by": "Admin#1234",
+      "added_at": "2024-01-01T13:00:00Z"
+    }
+  ],
+  "youtube_channels": [
+    {
+      "channel_id": "UC1234567890abcdef",
+      "channel_name": "Example YouTube Channel",
+      "added_by": "Admin#1234",
+      "added_at": "2024-01-01T12:00:00Z"
+    },
+    {
+      "channel_id": "UCabcdef1234567890",
+      "channel_name": "Another YouTube Channel",
+      "added_by": "Admin#1234",
+      "added_at": "2024-01-01T13:00:00Z"
+    }
+  ],
+  "forum_urls": [
+    {
+      "url": "https://example-forum.com",
+      "name": "Example Forum",
+      "added_by": "Admin#1234",
+      "added_at": "2024-01-01T12:00:00Z"
+    }
+  ]
+}
+
+
+

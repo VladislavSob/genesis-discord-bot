@@ -1,0 +1,16 @@
+[Unit]
+Description=Genesis Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=your_username
+WorkingDirectory=/path/to/Genesis_BOT
+Environment=PATH=/path/to/Genesis_BOT/venv/bin
+ExecStart=/path/to/Genesis_BOT/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+

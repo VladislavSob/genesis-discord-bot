@@ -1,0 +1,807 @@
+"""
+Модуль обработчиков для бота Genesis
+Содержит функции для работы с ролями, форумом, Twitch и YouTube
+"""
+
+import discord
+import json
+import os
+import re
+import time
+import logging
+from urllib.parse import urljoin, urlparse
+import aiohttp
+import asyncio
+import traceback
+from discord.ext import tasks
+from bs4 import BeautifulSoup
+
+# Получаем логгер
+logger = logging.getLogger("genesis_bot")
+
+# Получаем логгер
+logger = logging.getLogger("genesis_bot")
+
+# =============================================================================
+# КОНСТАНТЫ И НАСТРОЙКИ
+# =============================================================================
+
+# Файлы для хранения данных
+REACTION_ROLES_FILE = "reaction_roles.json"      # Роли для реакций
+REACTION_MESSAGE_FILE = "reaction_message.json"  # ID сообщения с ролями
+TRACKING_FILE = "channels.json"                  # Отслеживаемые каналы
+NOTIFIED_FILE = "notified.json"                  # Уже отправленные уведомления
+
+# URL форума для мониторинга
+FORUM_URL = "https://forum.gta5rp.com/threads/sa-gov-postanovlenija-ofisa-generalnogo-prokurora-shtata-san-andreas.3311595"
+FORUM_BASE = "https://forum.gta5rp.com"
+
+# API ключ для YouTube
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+# Конфликтующие роли (нельзя иметь одновременно)
+CONFLICTING_ROLES = {
+    "GOS": ["Crime"],
+    "Crime": ["GOS"]
+}
+
+# =============================================================================
+# УТИЛИТЫ ДЛЯ РАБОТЫ С JSON
+# =============================================================================
+
+def load_json(file_path, default_data):
+    """Загружает данные из JSON файла или создает новый с данными по умолчанию"""
+    if not os.path.exists(file_path):
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(default_data, f, ensure_ascii=False, indent=2)
+        return default_data
+    with open(file_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_json(file_path, data):
+    """Сохраняет данные в JSON файл"""
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_reaction_roles():
+    """Загружает роли для реакций из файла"""
+    return load_json(REACTION_ROLES_FILE, {})
+
+def load_reaction_message_id():
+    """Загружает ID сообщения с ролями из файла"""
+    data = load_json(REACTION_MESSAGE_FILE, {})
+    return data.get("message_id")
+
+def load_tracking():
+    """Загружает список отслеживаемых каналов, убирая дубликаты"""
+    data = load_json(TRACKING_FILE, {"twitch": [], "youtube": []})
+    data["twitch"] = list(dict.fromkeys([s.lower() for s in data.get("twitch", [])]))
+    data["youtube"] = list(dict.fromkeys(data.get("youtube", [])))
+    return data
+
+def save_tracking(data):
+    """Сохраняет список отслеживаемых каналов"""
+    save_json(TRACKING_FILE, data)
+
+def load_notified():
+    """Загружает список уже отправленных уведомлений"""
+    return load_json(NOTIFIED_FILE, {"twitch": {}, "youtube": {}, "forum": {}})
+
+def save_notified(data):
+    """Сохраняет список уже отправленных уведомлений"""
+    save_json(NOTIFIED_FILE, data)
+
+# --------------------------
+# Reaction roles setup
+# --------------------------
+
+def check_role_conflicts(member: discord.Member, new_role_name: str) -> tuple[bool, str]:
+    """
+    Проверяет конфликты ролей для пользователя (регистронезависимо).
+    Возвращает (можно_выдать_роль, сообщение_об_ошибке).
+    """
+    try:
+        new_role_l = new_role_name.strip().lower()
+        member_role_names_l = {r.name.strip().lower() for r in getattr(member, "roles", [])}
+
+        def conflicts_for(role_name: str) -> list[str]:
+            rn = role_name.strip().lower()
+            for key, values in CONFLICTING_ROLES.items():
+                if str(key).strip().lower() == rn:
+                    return list(values)
+            return []
+
+        def name_in_set(target: str, pool: set[str]) -> bool:
+            return target.strip().lower() in pool
+
+        # 1) Конфликты для новой роли: если у пользователя уже есть конфликтующая
+        for conflict_name in conflicts_for(new_role_name):
+            if name_in_set(conflict_name, member_role_names_l):
+                # Найдем красивое имя уже имеющейся конфликтующей роли для сообщения
+                existing_display = next((r.name for r in member.roles if r.name.strip().lower() == conflict_name.strip().lower()), conflict_name)
+                return False, f"❌ Нельзя получить роль **{new_role_name}**, так как у вас уже есть роль **{existing_display}**"
+
+        # 2) Конфликты от существующих ролей: если существующая роль конфликтует с новой
+        for existing_role in getattr(member, "roles", []):
+            for conflict_name in conflicts_for(existing_role.name):
+                if conflict_name.strip().lower() == new_role_l:
+                    return False, f"❌ Нельзя получить роль **{new_role_name}**, так как у вас уже есть роль **{existing_role.name}**"
+
+        return True, ""
+    except Exception:
+        # На всякий случай, если что-то пошло не так, не блокируем действие
+        return True, ""
+
+async def ensure_roles_message(guild: discord.Guild, channel_id: int):
+	roles_data = load_reaction_roles()
+	desired_text = "Выберите роль, нажав на соответствующую реакцию:\n" + "\n".join(
+		f"{emoji} — {role}" for emoji, role in roles_data.items()
+	)
+
+	channel = guild.get_channel(channel_id)
+	if channel is None:
+		try:
+			channel = await guild.fetch_channel(channel_id)
+		except Exception:
+			return
+
+	if os.path.exists(REACTION_MESSAGE_FILE):
+		try:
+			with open(REACTION_MESSAGE_FILE, "r", encoding="utf-8") as f:
+				msg_id = json.load(f).get("message_id")
+			if msg_id:
+				msg = await channel.fetch_message(msg_id)
+				if msg and msg.content.strip() == desired_text.strip():
+					return
+				else:
+					await msg.edit(content=desired_text)
+					try:
+						await msg.clear_reactions()
+					except Exception:
+						pass
+					for emoji in roles_data:
+						try:
+							await msg.add_reaction(emoji)
+						except Exception:
+							pass
+					return
+		except Exception:
+			pass
+
+	async for m in channel.history(limit=300):
+		try:
+			if m.content.strip() == desired_text.strip() and (guild.me is None or m.author == guild.me):
+				with open(REACTION_MESSAGE_FILE, "w", encoding="utf-8") as f:
+					json.dump({"message_id": m.id}, f, ensure_ascii=False, indent=2)
+				return
+		except Exception:
+			continue
+
+	new_msg = await channel.send(desired_text)
+	for emoji in roles_data:
+		try:
+			await new_msg.add_reaction(emoji)
+		except Exception:
+			pass
+	with open(REACTION_MESSAGE_FILE, "w", encoding="utf-8") as f:
+		json.dump({"message_id": new_msg.id}, f, ensure_ascii=False, indent=2)
+
+# --------------------------
+# Reaction handling
+# --------------------------
+async def handle_reaction_add(payload, bot):
+	msg_id = load_reaction_message_id()
+	if msg_id is None or payload.message_id != msg_id:
+		return
+
+	roles_data = load_reaction_roles()
+	guild = bot.get_guild(payload.guild_id)
+	if guild is None:
+		return
+
+	if payload.member is None or (hasattr(payload.member, "bot") and payload.member.bot):
+		try:
+			member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+		except Exception:
+			return
+	else:
+		member = payload.member
+
+	emoji = str(payload.emoji)
+	role_name = roles_data.get(emoji)
+	if role_name:
+		role = discord.utils.get(guild.roles, name=role_name)
+		if role:
+			# Проверяем конфликты ролей
+			can_add_role, error_message = check_role_conflicts(member, role_name)
+			
+			if not can_add_role:
+				# Удаляем реакцию пользователя, так как роль не может быть выдана
+				try:
+					message = await bot.get_channel(payload.channel_id).fetch_message(payload.message_id)
+					await message.remove_reaction(payload.emoji, member)
+					logger.info(f"Отклонена попытка получения роли {role_name} пользователем {member}: {error_message}")
+					
+					# Отправляем личное сообщение пользователю
+					try:
+						await member.send(error_message)
+					except discord.Forbidden:
+						# Если личные сообщения закрыты, игнорируем
+						pass
+					except Exception as e:
+						logger.error(f"Ошибка при отправке личного сообщения: {e}")
+				except Exception as e:
+					logger.error(f"Ошибка при удалении реакции: {e}")
+				return
+			
+			try:
+				await member.add_roles(role)
+				logger.info(f"Выдана роль {role_name} пользователю {member}")
+			except Exception:
+				traceback.print_exc()
+
+async def handle_reaction_remove(payload, bot):
+	msg_id = load_reaction_message_id()
+	if msg_id is None or payload.message_id != msg_id:
+		return
+
+	roles_data = load_reaction_roles()
+	guild = bot.get_guild(payload.guild_id)
+	if guild is None:
+		return
+
+	emoji = str(payload.emoji)
+	role_name = roles_data.get(emoji)
+	if role_name:
+		role = discord.utils.get(guild.roles, name=role_name)
+		member = guild.get_member(payload.user_id)
+		if role and member:
+			try:
+				await member.remove_roles(role)
+				logger.info(f"Снята роль {role_name} у пользователя {member}")
+			except Exception:
+				traceback.print_exc()
+
+# --------------------------
+# Forum parsing + notifier (re-send if deleted)
+# --------------------------
+async def parse_forum():
+	timeout = aiohttp.ClientTimeout(total=15)
+	headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+
+	async def fetch_soup(session, url):
+		async with session.get(url) as resp:
+			if resp.status != 200:
+				logger.error(f"Ошибка загрузки форума: {resp.status}")
+				return None
+			html = await resp.text()
+			return BeautifulSoup(html, "html.parser")
+
+	async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+		logger.debug(f"🔍 Проверяем форум: {FORUM_URL}")
+		soup = await fetch_soup(session, FORUM_URL)
+		if soup is None:
+			logger.error("❌ Не удалось загрузить страницу форума")
+			return None
+
+		last_page_href = None
+		nav = soup.select_one("nav.pageNav") or soup
+		for a in nav.select("a[href*='page-']"):
+			m = re.search(r"page-(\d+)", a.get("href", ""))
+			if m:
+				last_page_href = a["href"]
+
+		thread_page_url = FORUM_URL
+		if last_page_href:
+			thread_page_url = urljoin(FORUM_BASE, last_page_href)
+			logger.debug(f"📄 Переходим на последнюю страницу: {thread_page_url}")
+			soup = await fetch_soup(session, thread_page_url)
+			if soup is None:
+				return None
+
+		posts = soup.select("article.message")
+		if not posts:
+			logger.error("❌ Не найдено сообщений на странице")
+			return None
+
+		last_post = posts[-1]
+		logger.debug(f"📝 Найдено сообщений: {len(posts)}")
+
+		post_id = None
+		for attr_name in ("id", "data-content"):
+			attr_val = last_post.get(attr_name) or ""
+			m = re.search(r"post-(\d+)", attr_val)
+			if m:
+				post_id = m.group(1)
+				break
+		if not post_id:
+			link = last_post.select_one("a[href*='#post-']")
+			if link and link.has_attr("href"):
+				m = re.search(r"#post-(\d+)", link["href"])
+				if m:
+					post_id = m.group(1)
+
+		url = thread_page_url
+		if post_id:
+			url = f"{thread_page_url}#post-{post_id}"
+
+		body = last_post.select_one(".message-content .bbWrapper") or last_post.select_one(".bbWrapper")
+		if body:
+			text = body.get_text("\n", strip=True)
+		else:
+			text = last_post.get_text(" ", strip=True)
+
+		text = re.sub(r"\s+\n", "\n", text)
+		text = re.sub(r"\n{3,}", "\n\n", text)
+
+		overhead = len("Новый пост на форуме:\n") + len(url) + 2
+		max_len = max(0, 2000 - overhead)
+		if len(text) > max_len:
+			text = (text[: max(0, max_len - 3)] + "...") if max_len >= 3 else text[:max_len]
+
+		result = {"text": text, "url": url, "post_id": post_id or url}
+		logger.debug(f"✅ Получен пост ID: {post_id}, URL: {url}")
+		return result
+
+async def _forum_message_exists(channel: discord.TextChannel, url: str, text: str) -> bool:
+	async for m in channel.history(limit=200):
+		if m.author.bot and url in (m.content or ""):
+			return True
+	return False
+
+@tasks.loop(minutes=5)
+async def check_forum(bot, forum_channel_id: int):
+	try:
+		logger.debug(f"🔄 Проверка форума (канал: {forum_channel_id})")
+		post = await parse_forum()
+		if not post:
+			logger.error("❌ Не удалось получить пост с форума")
+			return
+
+		channel = bot.get_channel(forum_channel_id)
+		if channel is None:
+			logger.error(f"❌ Канал {forum_channel_id} не найден")
+			return
+
+		exists = await _forum_message_exists(channel, post["url"], post["text"])
+
+		notified = load_notified()
+		forum_state = notified.get("forum", {})
+		last_post_id = forum_state.get("last_post_id")
+
+		logger.debug(f"📊 Текущий ID поста: {post['post_id']}, Последний известный: {last_post_id}")
+
+		if not exists and last_post_id != post["post_id"]:
+			logger.info(f"📢 Отправляем уведомление о новом посте: {post['post_id']}")
+			await channel.send(f"Новый пост на форуме:\n{post['url']}\n\n{post['text']}")
+			forum_state["last_post_id"] = post["post_id"]
+			notified["forum"] = forum_state
+			save_notified(notified)
+			logger.info("✅ Уведомление отправлено и сохранено")
+			return
+		elif exists:
+			logger.debug("ℹ️ Пост уже был отправлен ранее")
+		elif last_post_id == post["post_id"]:
+			logger.debug("ℹ️ Пост не изменился")
+
+		if last_post_id != post["post_id"]:
+			forum_state["last_post_id"] = post["post_id"]
+			notified["forum"] = forum_state
+			save_notified(notified)
+			logger.debug("📝 Обновлен ID последнего поста")
+	except Exception as e:
+		logger.error(f"❌ Ошибка при проверке форума: {e}")
+		traceback.print_exc()
+
+async def diagnose_forum(bot, forum_channel_id: int):
+	"""Диагностика состояния форума"""
+	try:
+		logger.info("🔍 Диагностика форума...")
+		
+		# Проверяем канал
+		channel = bot.get_channel(forum_channel_id)
+		if channel is None:
+			return "❌ Канал форума не найден"
+		
+		# Проверяем права бота
+		permissions = channel.permissions_for(bot.user)
+		if not permissions.send_messages:
+			return "❌ Бот не может отправлять сообщения в канал"
+		
+		# Получаем текущий пост
+		post = await parse_forum()
+		if not post:
+			return "❌ Не удалось получить данные с форума"
+		
+		# Проверяем состояние уведомлений
+		notified = load_notified()
+		forum_state = notified.get("forum", {})
+		last_post_id = forum_state.get("last_post_id")
+		
+		# Проверяем, существует ли уже сообщение
+		exists = await _forum_message_exists(channel, post["url"], post["text"])
+		
+		result = f"✅ Диагностика завершена:\n"
+		result += f"📝 Текущий пост ID: {post['post_id']}\n"
+		result += f"📝 Последний известный ID: {last_post_id}\n"
+		result += f"📢 Сообщение уже отправлено: {'Да' if exists else 'Нет'}\n"
+		result += f"🔗 URL: {post['url']}\n"
+		result += f"📄 Текст: {post['text'][:100]}..."
+		
+		return result
+		
+	except Exception as e:
+		return f"❌ Ошибка диагностики: {e}"
+
+# --------------------------
+# Twitch tracking (2 минуты) + token refresh
+# --------------------------
+_twitch_access_token = None
+_twitch_token_expires_at = 0.0
+
+async def _refresh_twitch_token(session: aiohttp.ClientSession) -> bool:
+	global _twitch_access_token, _twitch_token_expires_at
+	client_id = os.getenv("TWITCH_CLIENT_ID")
+	client_secret = os.getenv("TWITCH_CLIENT_SECRET") or os.getenv("TWITCH_TOKEN")
+	if not client_id or not client_secret:
+		logger.warning("Twitch: не задан TWITCH_CLIENT_ID или TWITCH_CLIENT_SECRET")
+		return False
+	data = {"client_id": client_id, "client_secret": client_secret, "grant_type": "client_credentials"}
+	async with session.post("https://id.twitch.tv/oauth2/token", data=data) as resp:
+		js = await resp.json()
+		if resp.status != 200:
+			logger.error(f"Twitch token error {resp.status}: {js}")
+			return False
+		_twitch_access_token = js.get("access_token")
+		expires_in = js.get("expires_in", 3600)
+		_twitch_token_expires_at = time.time() + max(60, int(expires_in) - 60)
+		return True
+
+async def _twitch_headers(session: aiohttp.ClientSession):
+	global _twitch_access_token, _twitch_token_expires_at
+	if _twitch_access_token is None or time.time() >= _twitch_token_expires_at:
+		ok = await _refresh_twitch_token(session)
+		if not ok:
+			return None
+	client_id = os.getenv("TWITCH_CLIENT_ID")
+	return {"Client-ID": client_id, "Authorization": f"Bearer {_twitch_access_token}"}
+
+async def _fetch_twitch_streams(session: aiohttp.ClientSession, logins):
+	headers = await _twitch_headers(session)
+	if not headers:
+		return []
+	streams = []
+	for i in range(0, len(logins), 100):
+		chunk = logins[i:i+100]
+		params = "&".join(f"user_login={login}" for login in chunk)
+		url = f"https://api.twitch.tv/helix/streams?{params}"
+		async def do_request(hdrs):
+			async with session.get(url, headers=hdrs) as resp:
+				if resp.status == 401:
+					return {"unauthorized": True}
+				if resp.status != 200:
+					return None
+				return await resp.json()
+		data = await do_request(headers)
+		if data == {"unauthorized": True}:
+			if await _refresh_twitch_token(session):
+				headers = await _twitch_headers(session)
+				data = await do_request(headers)
+			else:
+				data = None
+		if data and "data" in data:
+			streams.extend(data["data"])
+	return streams
+
+def _missing_send_perms(channel) -> list[str]:
+	try:
+		guild = getattr(channel, "guild", None)
+		if guild is None:
+			return ["View Channel", "Send Messages"]
+		me = guild.me
+		perms = channel.permissions_for(me)  # type: ignore[attr-defined]
+		missing = []
+		if not perms.view_channel:
+			missing.append("View Channel")
+		if not perms.send_messages:
+			missing.append("Send Messages")
+		if not perms.embed_links:
+			missing.append("Embed Links")
+		return missing
+	except Exception:
+		return ["unknown"]
+
+@tasks.loop(seconds=120)  # Изменено с 10 секунд на 2 минуты
+async def poll_twitch(bot, notifications_channel_id: int):
+	try:
+		tracking = load_tracking()
+		logins = tracking.get("twitch", [])
+		if not logins:
+			return
+
+		timeout = aiohttp.ClientTimeout(total=8)
+		async with aiohttp.ClientSession(timeout=timeout) as session:
+			live_streams = await _fetch_twitch_streams(session, logins)
+
+		channel = bot.get_channel(notifications_channel_id)
+		if channel is None:
+			return
+
+		missing = _missing_send_perms(channel)
+		if missing:
+			logger.warning(f"Twitch: нет прав в канале уведомлений ({notifications_channel_id}): {', '.join(missing)}")
+			return
+
+		notified = load_notified()
+		notified_twitch = notified.get("twitch", {})
+
+		for stream in live_streams:
+			login = (stream.get("user_login") or "").lower()
+			stream_id = stream.get("id")
+			title = stream.get("title", "")
+			if not login or not stream_id:
+				continue
+			if notified_twitch.get(login) == stream_id:
+				continue
+			notified_twitch[login] = stream_id
+			url = f"https://twitch.tv/{login}"
+			try:
+				await channel.send(f"В эфире на Twitch: {url}\n{title[:1900]}")
+			except Exception:
+				traceback.print_exc()
+
+		notified["twitch"] = notified_twitch
+		save_notified(notified)
+	except Exception:
+		traceback.print_exc()
+
+async def twitch_check_and_notify(bot: discord.Client, notifications_channel_id: int, login: str):
+	login_norm = login.strip().lower()
+	timeout = aiohttp.ClientTimeout(total=8)
+	async with aiohttp.ClientSession(timeout=timeout) as session:
+		streams = await _fetch_twitch_streams(session, [login_norm])
+	if not streams:
+		return True, f"{login_norm}: офлайн или не найден."
+
+	stream = streams[0]
+	stream_id = stream.get("id")
+	title = stream.get("title", "")
+	url = f"https://twitch.tv/{login_norm}"
+
+	channel = bot.get_channel(notifications_channel_id)
+	if channel is None:
+		return False, f"Не найден канал уведомлений {notifications_channel_id}."
+
+	missing = _missing_send_perms(channel)
+	if missing:
+		return False, f"Недостаточно прав в канале уведомлений: {', '.join(missing)}"
+
+	notified = load_notified()
+	notified_twitch = notified.get("twitch", {})
+	if notified_twitch.get(login_norm) == stream_id:
+		return True, f"{login_norm}: уже уведомлено для текущего эфира ({stream_id})."
+
+	notified_twitch[login_norm] = stream_id
+	notified["twitch"] = notified_twitch
+	save_notified(notified)
+
+	try:
+		await channel.send(f"В эфире на Twitch: {url}\n{title[:1900]}")
+		return True, f"{login_norm}: live, отправлено уведомление."
+	except Exception:
+		traceback.print_exc()
+		return False, f"{login_norm}: ошибка отправки уведомления."
+
+# --------------------------
+# YouTube tracking (2 минуты), поддержка @handle/URL/UC
+# --------------------------
+def _extract_channel_id_from_url(url: str) -> str | None:
+	try:
+		parsed = urlparse(url)
+		parts = [p for p in parsed.path.split("/") if p]
+		for i, p in enumerate(parts):
+			if p == "channel" and i + 1 < len(parts) and re.fullmatch(r"UC[0-9A-Za-z_-]{21,}", parts[i+1]):
+				return parts[i+1]
+		for p in parts:
+			if p.startswith("@"):
+				return p
+	except Exception:
+		return None
+	return None
+
+async def _resolve_youtube_channel_id(session: aiohttp.ClientSession, input_str: str) -> str | None:
+	s = input_str.strip()
+	if re.fullmatch(r"UC[0-9A-Za-z_-]{21,}", s):
+		return s
+	if s.startswith("http://") or s.startswith("https://"):
+		extracted = _extract_channel_id_from_url(s)
+		if extracted and extracted.startswith("UC"):
+			return extracted
+		if extracted and extracted.startswith("@"):
+			s = extracted
+	handle = s if s.startswith("@") else "@" + s
+	if not YOUTUBE_API_KEY:
+		return None
+	params = {"part": "id", "forHandle": handle, "key": YOUTUBE_API_KEY}
+	async with session.get("https://www.googleapis.com/youtube/v3/channels", params=params) as resp:
+		data = await resp.json()
+		if resp.status == 200 and data.get("items"):
+			cid = data["items"][0].get("id")
+			if isinstance(cid, str) and cid.startswith("UC"):
+				return cid
+	params = {"part": "snippet", "type": "channel", "q": handle.lstrip("@"), "maxResults": "1", "key": YOUTUBE_API_KEY}
+	async with session.get("https://www.googleapis.com/youtube/v3/search", params=params) as resp:
+		data = await resp.json()
+		items = data.get("items", [])
+		if resp.status == 200 and items:
+			cid = (items[0].get("id") or {}).get("channelId")
+			if cid and cid.startswith("UC"):
+				return cid
+	return None
+
+async def _youtube_latest_video(session: aiohttp.ClientSession, channel_id: str):
+	if not YOUTUBE_API_KEY:
+		return None
+	params = {"key": YOUTUBE_API_KEY, "channelId": channel_id, "part": "snippet", "order": "date", "maxResults": "1", "type": "video", "safeSearch": "none"}
+	async with session.get("https://www.googleapis.com/youtube/v3/search", params=params) as resp:
+		if resp.status != 200:
+			return None
+		data = await resp.json()
+		items = data.get("items", [])
+		if not items:
+			return None
+		it = items[0]
+		vid = (it.get("id") or {}).get("videoId")
+		title = (it.get("snippet") or {}).get("title", "")
+		if not vid:
+			return None
+		return {"video_id": vid, "title": title}
+
+@tasks.loop(seconds=120)  # Изменено с 10 секунд на 2 минуты
+async def poll_youtube(bot, notifications_channel_id: int):
+	try:
+		if not YOUTUBE_API_KEY:
+			return
+		tracking = load_tracking()
+		channels = tracking.get("youtube", [])
+		if not channels:
+			return
+
+		timeout = aiohttp.ClientTimeout(total=8)
+		async with aiohttp.ClientSession(timeout=timeout) as session:
+			notified = load_notified()
+			notified_youtube = notified.get("youtube", {})
+			channel = bot.get_channel(notifications_channel_id)
+			if channel is None:
+				return
+
+			missing = _missing_send_perms(channel)
+			if missing:
+				return
+
+			for channel_id in channels:
+				latest = await _youtube_latest_video(session, channel_id)
+				if not latest:
+					continue
+				vid = latest["video_id"]
+				title = latest.get("title", "")
+				last_vid = notified_youtube.get(channel_id)
+				if last_vid != vid:
+					notified_youtube[channel_id] = vid
+					url = f"https://youtu.be/{vid}"
+					try:
+						await channel.send(f"Новое видео на YouTube: {url}\n{title[:1900]}")
+					except Exception:
+						traceback.print_exc()
+
+			notified["youtube"] = notified_youtube
+			save_notified(notified)
+	except Exception:
+		traceback.print_exc()
+
+async def youtube_check_and_notify(bot: discord.Client, notifications_channel_id: int, channel_input: str):
+	timeout = aiohttp.ClientTimeout(total=8)
+	async with aiohttp.ClientSession(timeout=timeout) as session:
+		cid = await _resolve_youtube_channel_id(session, channel_input)
+		if not cid:
+			return False, "Не удалось определить channelId. Укажите @handle или ссылку вида https://www.youtube.com/@handle"
+		latest = await _youtube_latest_video(session, cid)
+
+	if not latest:
+		return True, f"{cid}: новых видео не найдено."
+
+	channel = bot.get_channel(notifications_channel_id)
+	if channel is None:
+		return False, f"Не найден канал уведомлений {notifications_channel_id}."
+
+	missing = _missing_send_perms(channel)
+	if missing:
+		return False, f"Недостаточно прав в канале уведомлений: {', '.join(missing)}"
+
+	notified = load_notified()
+	notified_youtube = notified.get("youtube", {})
+	if notified_youtube.get(cid) == latest["video_id"]:
+		return True, f"{cid}: уже уведомлено об этом видео ({latest['video_id']})."
+
+	notified_youtube[cid] = latest["video_id"]
+	notified["youtube"] = notified_youtube
+	save_notified(notified)
+
+	url = f"https://youtu.be/{latest['video_id']}"
+	title = latest.get("title", "")[:1900]
+	try:
+		await channel.send(f"Новое видео на YouTube: {url}\n{title}")
+		return True, f"{cid}: найдено новое видео, уведомление отправлено."
+	except Exception:
+		traceback.print_exc()
+		return False, f"{cid}: ошибка отправки уведомления."
+
+def start_tracking_tasks(bot: discord.Client, notifications_channel_id: int):
+	if not poll_twitch.is_running():
+		poll_twitch.start(bot, notifications_channel_id)
+	if not poll_youtube.is_running():
+		poll_youtube.start(bot, notifications_channel_id)
+
+# --------------------------
+# Manage tracking lists
+# --------------------------
+def add_twitch_channel(login: str):
+	login_norm = login.strip().lower()
+	if not re.fullmatch(r"[a-z0-9_]{3,25}", login_norm):
+		return False, "Некорректный Twitch-логин."
+	data = load_tracking()
+	if login_norm in data["twitch"]:
+		return False, "Такой Twitch-канал уже добавлен."
+	data["twitch"].append(login_norm)
+	save_tracking(data)
+	return True, f"Twitch-канал добавлен: {login_norm}"
+
+def remove_twitch_channel(login: str):
+	login_norm = login.strip().lower()
+	data = load_tracking()
+	if login_norm not in data["twitch"]:
+		return False, "Такого Twitch-канала нет в списке."
+	data["twitch"] = [l for l in data["twitch"] if l != login_norm]
+	save_tracking(data)
+	notified = load_notified()
+	notified.get("twitch", {}).pop(login_norm, None)
+	save_notified(notified)
+	return True, f"Twitch-канал удалён: {login_norm}"
+
+def list_twitch_channels():
+	return load_tracking().get("twitch", [])
+
+async def add_youtube_channel(channel: str):
+	timeout = aiohttp.ClientTimeout(total=8)
+	async with aiohttp.ClientSession(timeout=timeout) as session:
+		cid = await _resolve_youtube_channel_id(session, channel)
+	if not cid:
+		return False, "Укажите @handle или ссылку вида https://www.youtube.com/@handle"
+	data = load_tracking()
+	if cid in data["youtube"]:
+		return False, "Канал уже добавлен."
+	data["youtube"].append(cid)
+	save_tracking(data)
+	return True, f"YouTube-канал добавлен: {cid}"
+
+async def remove_youtube_channel(channel: str):
+	timeout = aiohttp.ClientTimeout(total=8)
+	cid = None
+	try:
+		async with aiohttp.ClientSession(timeout=timeout) as session:
+			cid = await _resolve_youtube_channel_id(session, channel)
+	except Exception:
+		cid = None
+	data = load_tracking()
+	target = cid or channel.strip()
+	if target in data["youtube"]:
+		data["youtube"] = [c for c in data["youtube"] if c != target]
+		save_tracking(data)
+		notified = load_notified()
+		notified.get("youtube", {}).pop(target, None)
+		save_notified(notified)
+		return True, f"YouTube-канал удалён: {target}"
+	return False, "Такого YouTube-канала нет в списке."
+
+def list_youtube_channels():
+	return load_tracking().get("youtube", [])
