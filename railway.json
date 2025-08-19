@@ -5,10 +5,7 @@
   },
   "deploy": {
     "startCommand": "python bot.py",
-    "healthcheckPath": "/",
-    "healthcheckTimeout": 100,
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
+    "healthcheckPath": "",
+    "healthcheckTimeout": 0
   }
 }
-
