@@ -213,9 +213,9 @@ async def fix_conflicting_roles(guild: discord.Guild) -> tuple[int, list[str]]:
                     for conflict_name in CONFLICTING_ROLES[role.name]:
                         conflict_role = discord.utils.get(guild.roles, name=conflict_name)
                         if conflict_role and conflict_role in member_roles:
-                            # Находим роль, которую нужно снять (оставляем ту, что была выдана позже)
+                            # Если обе роли еще не помечены для удаления, снимаем конфликтующую
                             if role not in roles_to_remove and conflict_role not in roles_to_remove:
-                                # По умолчанию снимаем конфликтующую роль
+                                # Снимаем конфликтующую роль (оставляем основную)
                                 roles_to_remove.append(conflict_role)
                                 messages.append(f"У пользователя {member.display_name} обнаружены конфликтующие роли: {role.name} и {conflict_name}. Снята роль {conflict_name}")
             
@@ -261,23 +261,41 @@ async def handle_reaction_add(payload, bot):
 			can_add_role, error_message = check_role_conflicts(member, role_name)
 			
 			if not can_add_role:
-				# Удаляем реакцию пользователя, так как роль не может быть выдана
-				try:
-					message = await bot.get_channel(payload.channel_id).fetch_message(payload.message_id)
-					await message.remove_reaction(payload.emoji, member)
-					logger.info(f"Отклонена попытка получения роли {role_name} пользователем {member}: {error_message}")
-					
-					# Отправляем личное сообщение пользователю
+				# Находим конфликтующие роли, которые нужно снять
+				conflicting_roles = []
+				member_role_names = {r.name for r in member.roles}
+				
+				# Проверяем конфликты для новой роли
+				for conflict_name in CONFLICTING_ROLES.get(role_name, []):
+					if conflict_name in member_role_names:
+						conflict_role = discord.utils.get(guild.roles, name=conflict_name)
+						if conflict_role:
+							conflicting_roles.append(conflict_role)
+				
+				# Снимаем конфликтующие роли
+				if conflicting_roles:
 					try:
-						await member.send(error_message)
-					except discord.Forbidden:
-						# Если личные сообщения закрыты, игнорируем
-						pass
+						await member.remove_roles(*conflicting_roles)
+						conflicting_names = ", ".join(r.name for r in conflicting_roles)
+						logger.info(f"Сняты конфликтующие роли {conflicting_names} у пользователя {member} для получения роли {role_name}")
+						
+						# Отправляем уведомление пользователю
+						try:
+							await member.send(f"⚠️ При получении роли **{role_name}** автоматически сняты конфликтующие роли: **{conflicting_names}**")
+						except discord.Forbidden:
+							# Если личные сообщения закрыты, игнорируем
+							pass
+						except Exception as e:
+							logger.error(f"Ошибка при отправке уведомления: {e}")
 					except Exception as e:
-						logger.error(f"Ошибка при отправке личного сообщения: {e}")
-				except Exception as e:
-					logger.error(f"Ошибка при удалении реакции: {e}")
-				return
+						logger.error(f"Ошибка при снятии конфликтующих ролей: {e}")
+						# Если не удалось снять конфликтующие роли, удаляем реакцию
+						try:
+							message = await bot.get_channel(payload.channel_id).fetch_message(payload.message_id)
+							await message.remove_reaction(payload.emoji, member)
+						except Exception as e2:
+							logger.error(f"Ошибка при удалении реакции: {e2}")
+						return
 			
 			try:
 				await member.add_roles(role)
@@ -302,36 +320,9 @@ async def handle_reaction_remove(payload, bot):
 		member = guild.get_member(payload.user_id)
 		if role and member:
 			try:
-				# Проверяем, есть ли у пользователя конфликтующие роли
-				member_role_names = {r.name for r in member.roles}
-				conflicting_roles = []
-				
-				# Проверяем конфликты для роли, которую собираемся снять
-				for conflict_name in CONFLICTING_ROLES.get(role_name, []):
-					if conflict_name in member_role_names:
-						conflicting_role = discord.utils.get(guild.roles, name=conflict_name)
-						if conflicting_role:
-							conflicting_roles.append(conflicting_role)
-				
-				# Снимаем основную роль
+				# Просто снимаем роль без дополнительных проверок
 				await member.remove_roles(role)
 				logger.info(f"Снята роль {role_name} у пользователя {member}")
-				
-				# Если есть конфликтующие роли, снимаем их тоже
-				if conflicting_roles:
-					await member.remove_roles(*conflicting_roles)
-					conflicting_names = ", ".join(r.name for r in conflicting_roles)
-					logger.info(f"Автоматически сняты конфликтующие роли {conflicting_names} у пользователя {member}")
-					
-					# Отправляем уведомление пользователю
-					try:
-						await member.send(f"⚠️ При снятии роли **{role_name}** автоматически сняты конфликтующие роли: **{conflicting_names}**")
-					except discord.Forbidden:
-						# Если личные сообщения закрыты, игнорируем
-						pass
-					except Exception as e:
-						logger.error(f"Ошибка при отправке уведомления: {e}")
-						
 			except Exception as e:
 				logger.error(f"Ошибка при снятии роли: {e}")
 
