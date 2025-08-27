@@ -1,0 +1,30 @@
+{
+  "role_changes": {
+    "GOS": {
+      "added": 2,
+      "removed": 2,
+      "conflicts": 0,
+      "last_activity": 1756265272.9162903
+    },
+    "Crime": {
+      "added": 1,
+      "removed": 4,
+      "conflicts": 2,
+      "last_activity": 1756265271.8838544
+    }
+  },
+  "conflict_resolutions": {
+    "Crime": [
+      {
+        "user": "sinfulpreacher",
+        "timestamp": 1756265260.1293566
+      },
+      {
+        "user": "sinfulpreacher",
+        "timestamp": 1756265260.1427712
+      }
+    ]
+  },
+  "total_changes": 11,
+  "last_reset": 1756265227.8493664
+}
