@@ -358,7 +358,7 @@ async def parse_forum():
 		text = re.sub(r"\s+\n", "\n", text)
 		text = re.sub(r"\n{3,}", "\n\n", text)
 
-		overhead = len("Новый пост на форуме:\n") + len(url) + 2
+		overhead = len("Новое постановление:\n") + len(url) + 1
 		max_len = max(0, 2000 - overhead)
 		if len(text) > max_len:
 			text = (text[: max(0, max_len - 3)] + "...") if max_len >= 3 else text[:max_len]
@@ -436,7 +436,7 @@ async def parse_orders():
 		text = re.sub(r"\s+\n", "\n", text)
 		text = re.sub(r"\n{3,}", "\n\n", text)
 
-		overhead = len("Новый ордер:\n") + len(url) + 2
+		overhead = len("Новый ордер:\n") + len(url) + 1
 		max_len = max(0, 2000 - overhead)
 		if len(text) > max_len:
 			text = (text[: max(0, max_len - 3)] + "...") if max_len >= 3 else text[:max_len]
@@ -475,7 +475,7 @@ async def check_forum(bot, forum_channel_id: int):
 
 		if not exists and last_post_id != post["post_id"]:
 			logger.info(f"📢 Отправляем уведомление о новом посте: {post['post_id']}")
-			await channel.send(f"Новый пост на форуме:\n{post['url']}\n\n{post['text']}")
+			await channel.send(f"Новое постановление:\n{post['url']}")
 			forum_state["last_post_id"] = post["post_id"]
 			notified["forum"] = forum_state
 			save_notified(notified)
@@ -519,7 +519,7 @@ async def check_orders(bot, orders_channel_id: int):
 
 		if not exists and last_order_id != order["post_id"]:
 			logger.info(f"📢 Отправляем уведомление о новом ордере: {order['post_id']}")
-			await channel.send(f"Новый ордер:\n{order['url']}\n\n{order['text']}")
+			await channel.send(f"Новый ордер:\n{order['url']}")
 			orders_state["last_order_id"] = order["post_id"]
 			notified["orders"] = orders_state
 			save_notified(notified)

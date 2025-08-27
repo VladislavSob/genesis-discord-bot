@@ -398,7 +398,7 @@ async def force_forum_check(interaction: discord.Interaction):
         post = await handlers.parse_forum()
         if post and post.get("text"):
             await interaction.followup.send(
-                f"📋 Последний пост на форуме:\n{post['url']}\n\n{post['text']}", 
+                f"📋 Последний пост на форуме:\n{post['url']}", 
                 ephemeral=True
             )
         else:
@@ -418,6 +418,31 @@ async def forum_diagnose(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка диагностики: {e}", ephemeral=True)
 
+@bot.tree.command(name="reset_forum_state", description="Сбросить состояние форума (если удалили сообщение)")
+@admin_only()
+async def reset_forum_state(interaction: discord.Interaction):
+    """Сбрасывает состояние форума, чтобы бот отправил последний пост заново"""
+    await ensure_deferred(interaction, ephemeral=True)
+    
+    try:
+        notified = handlers.load_notified()
+        forum_state = notified.get("forum", {})
+        old_post_id = forum_state.get("last_post_id")
+        
+        # Сбрасываем ID последнего поста
+        forum_state["last_post_id"] = None
+        notified["forum"] = forum_state
+        handlers.save_notified(notified)
+        
+        await interaction.followup.send(
+            f"✅ Состояние форума сброшено!\n"
+            f"📝 Предыдущий ID поста: {old_post_id}\n"
+            f"🔄 Бот отправит последний пост при следующей проверке.", 
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка при сбросе состояния: {e}", ephemeral=True)
+
 # =============================================================================
 # КОМАНДЫ ДЛЯ РАБОТЫ С ОРДЕРАМИ
 # =============================================================================
@@ -432,7 +457,7 @@ async def force_orders_check(interaction: discord.Interaction):
         order = await handlers.parse_orders()
         if order and order.get("text"):
             await interaction.followup.send(
-                f"📋 Последний ордер:\n{order['url']}\n\n{order['text']}", 
+                f"📋 Последний ордер:\n{order['url']}", 
                 ephemeral=True
             )
         else:
@@ -451,6 +476,31 @@ async def orders_diagnose(interaction: discord.Interaction):
         await interaction.followup.send(f"🔍 {result}", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка диагностики: {e}", ephemeral=True)
+
+@bot.tree.command(name="reset_orders_state", description="Сбросить состояние ордеров (если удалили сообщение)")
+@admin_only()
+async def reset_orders_state(interaction: discord.Interaction):
+    """Сбрасывает состояние ордеров, чтобы бот отправил последний ордер заново"""
+    await ensure_deferred(interaction, ephemeral=True)
+    
+    try:
+        notified = handlers.load_notified()
+        orders_state = notified.get("orders", {})
+        old_order_id = orders_state.get("last_order_id")
+        
+        # Сбрасываем ID последнего ордера
+        orders_state["last_order_id"] = None
+        notified["orders"] = orders_state
+        handlers.save_notified(notified)
+        
+        await interaction.followup.send(
+            f"✅ Состояние ордеров сброшено!\n"
+            f"📝 Предыдущий ID ордера: {old_order_id}\n"
+            f"🔄 Бот отправит последний ордер при следующей проверке.", 
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка при сбросе состояния: {e}", ephemeral=True)
 
 # =============================================================================
 # КОМАНДЫ ДЛЯ РАБОТЫ С TWITCH
