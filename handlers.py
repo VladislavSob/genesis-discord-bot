@@ -189,6 +189,51 @@ async def ensure_roles_message(guild: discord.Guild, channel_id: int):
 # --------------------------
 # Reaction handling
 # --------------------------
+
+async def fix_conflicting_roles(guild: discord.Guild) -> tuple[int, list[str]]:
+    """
+    Проверяет всех участников сервера на наличие конфликтующих ролей
+    и автоматически снимает конфликтующие роли.
+    Возвращает (количество_исправлений, список_сообщений).
+    """
+    fixed_count = 0
+    messages = []
+    
+    try:
+        for member in guild.members:
+            if member.bot:
+                continue
+                
+            member_roles = list(member.roles)
+            roles_to_remove = []
+            
+            # Проверяем каждую роль пользователя на конфликты
+            for role in member_roles:
+                if role.name in CONFLICTING_ROLES:
+                    for conflict_name in CONFLICTING_ROLES[role.name]:
+                        conflict_role = discord.utils.get(guild.roles, name=conflict_name)
+                        if conflict_role and conflict_role in member_roles:
+                            # Находим роль, которую нужно снять (оставляем ту, что была выдана позже)
+                            if role not in roles_to_remove and conflict_role not in roles_to_remove:
+                                # По умолчанию снимаем конфликтующую роль
+                                roles_to_remove.append(conflict_role)
+                                messages.append(f"У пользователя {member.display_name} обнаружены конфликтующие роли: {role.name} и {conflict_name}. Снята роль {conflict_name}")
+            
+            # Снимаем конфликтующие роли
+            if roles_to_remove:
+                try:
+                    await member.remove_roles(*roles_to_remove)
+                    fixed_count += len(roles_to_remove)
+                    logger.info(f"Исправлены конфликтующие роли у пользователя {member}: сняты {[r.name for r in roles_to_remove]}")
+                except Exception as e:
+                    logger.error(f"Ошибка при снятии конфликтующих ролей у {member}: {e}")
+                    messages.append(f"Ошибка при снятии ролей у {member.display_name}: {e}")
+                    
+    except Exception as e:
+        logger.error(f"Ошибка при проверке конфликтующих ролей: {e}")
+        messages.append(f"Ошибка при проверке: {e}")
+    
+    return fixed_count, messages
 async def handle_reaction_add(payload, bot):
 	msg_id = load_reaction_message_id()
 	if msg_id is None or payload.message_id != msg_id:
@@ -257,8 +302,36 @@ async def handle_reaction_remove(payload, bot):
 		member = guild.get_member(payload.user_id)
 		if role and member:
 			try:
+				# Проверяем, есть ли у пользователя конфликтующие роли
+				member_role_names = {r.name for r in member.roles}
+				conflicting_roles = []
+				
+				# Проверяем конфликты для роли, которую собираемся снять
+				for conflict_name in CONFLICTING_ROLES.get(role_name, []):
+					if conflict_name in member_role_names:
+						conflicting_role = discord.utils.get(guild.roles, name=conflict_name)
+						if conflicting_role:
+							conflicting_roles.append(conflicting_role)
+				
+				# Снимаем основную роль
 				await member.remove_roles(role)
 				logger.info(f"Снята роль {role_name} у пользователя {member}")
+				
+				# Если есть конфликтующие роли, снимаем их тоже
+				if conflicting_roles:
+					await member.remove_roles(*conflicting_roles)
+					conflicting_names = ", ".join(r.name for r in conflicting_roles)
+					logger.info(f"Автоматически сняты конфликтующие роли {conflicting_names} у пользователя {member}")
+					
+					# Отправляем уведомление пользователю
+					try:
+						await member.send(f"⚠️ При снятии роли **{role_name}** автоматически сняты конфликтующие роли: **{conflicting_names}**")
+					except discord.Forbidden:
+						# Если личные сообщения закрыты, игнорируем
+						pass
+					except Exception as e:
+						logger.error(f"Ошибка при отправке уведомления: {e}")
+						
 			except Exception as e:
 				logger.error(f"Ошибка при снятии роли: {e}")
 

@@ -346,6 +346,40 @@ async def sync_cmd(interaction: discord.Interaction):
             ephemeral=True
         )
 
+@bot.tree.command(name="fix_roles", description="Исправить конфликтующие роли на сервере")
+@admin_only()
+async def fix_roles_cmd(interaction: discord.Interaction):
+    """Проверяет и исправляет все конфликтующие роли на сервере"""
+    await ensure_deferred(interaction, ephemeral=True)
+    
+    try:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("❌ Не удалось получить информацию о сервере", ephemeral=True)
+            return
+            
+        await interaction.followup.send("🔍 Проверяю конфликтующие роли...", ephemeral=True)
+        
+        fixed_count, messages = await handlers.fix_conflicting_roles(guild)
+        
+        if fixed_count == 0:
+            await interaction.followup.send("✅ Конфликтующих ролей не найдено!", ephemeral=True)
+        else:
+            # Формируем сообщение с результатами
+            result_message = f"✅ Исправлено {fixed_count} конфликтующих ролей!\n\n"
+            
+            # Добавляем первые 10 сообщений (чтобы не превысить лимит Discord)
+            for i, msg in enumerate(messages[:10]):
+                result_message += f"• {msg}\n"
+            
+            if len(messages) > 10:
+                result_message += f"\n... и еще {len(messages) - 10} исправлений"
+            
+            await interaction.followup.send(result_message, ephemeral=True)
+            
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка при исправлении ролей: {e}", ephemeral=True)
+
 # =============================================================================
 # КОМАНДЫ ДЛЯ РАБОТЫ С ФОРУМОМ
 # =============================================================================
