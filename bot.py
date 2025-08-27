@@ -10,6 +10,7 @@ load_dotenv(override=True)
 
 import discord
 from discord.ext import commands
+from discord.ext import tasks
 from discord import app_commands
 import handlers
 import traceback
@@ -43,7 +44,7 @@ def setup_logging():
         "logs/genesis.log",
         when="midnight",
         interval=1,
-        backupCount=1,
+        backupCount=7,
         encoding="utf-8",
         utc=False
     )
@@ -69,7 +70,7 @@ def setup_logging():
         "logs/forum.log",
         when="midnight",
         interval=1,
-        backupCount=1,
+        backupCount=7,
         encoding="utf-8",
         utc=False
     )
@@ -86,7 +87,7 @@ def setup_logging():
         "logs/orders.log",
         when="midnight",
         interval=1,
-        backupCount=1,
+        backupCount=7,
         encoding="utf-8",
         utc=False
     )
@@ -179,6 +180,18 @@ async def ensure_deferred(interaction: discord.Interaction, *, ephemeral: bool =
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=ephemeral)
 
+
+# =============================================================================
+# HEARTBEAT ДЛЯ РОТАЦИИ ЛОГОВ
+# =============================================================================
+
+@tasks.loop(minutes=10)
+async def heartbeat_log():
+    try:
+        logger.debug("heartbeat: bot alive")
+    except Exception:
+        pass
+
 # =============================================================================
 # ФУНКЦИИ ПРОВЕРКИ ПРАВ ДОСТУПА
 # =============================================================================
@@ -229,6 +242,13 @@ class GenesisBot(commands.Bot):
         except Exception as e:
             self.logger.error(f"❌ Ошибка при синхронизации команд: {e}")
             traceback.print_exc()
+        
+        # Heartbeat: чтобы ротация логов срабатывала сразу после полуночи
+        try:
+            if not heartbeat_log.is_running():
+                heartbeat_log.start()
+        except Exception:
+            pass
 
 # Создаем экземпляр бота
 bot = GenesisBot()
