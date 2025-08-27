@@ -30,6 +30,7 @@ REACTION_ROLES_FILE = "reaction_roles.json"      # Роли для реакци�
 REACTION_MESSAGE_FILE = "reaction_message.json"  # ID сообщения с ролями
 TRACKING_FILE = "channels.json"                  # Отслеживаемые каналы
 NOTIFIED_FILE = "notified.json"                  # Уже отправленные уведомления
+ROLE_STATS_FILE = "role_stats.json"              # Статистика ролей
 
 # URL форума для мониторинга
 FORUM_URL = "https://forum.gta5rp.com/threads/sa-gov-postanovlenija-ofisa-generalnogo-prokurora-shtata-san-andreas.3311595"
@@ -40,9 +41,18 @@ FORUM_BASE = "https://forum.gta5rp.com"
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 # Конфликтующие роли (нельзя иметь одновременно)
+# Приоритет: GOS > Crime (если конфликт, оставляем GOS)
 CONFLICTING_ROLES = {
     "GOS": ["Crime"],
     "Crime": ["GOS"]
+}
+
+# Приоритеты ролей (чем выше число, тем выше приоритет)
+ROLE_PRIORITIES = {
+    "GOS": 2,
+    "Crime": 1,
+    "Участник": 0,
+    "5RP": 0
 }
 
 # =============================================================================
@@ -91,46 +101,117 @@ def save_notified(data):
     """Сохраняет список уже отправленных уведомлений"""
     save_json(NOTIFIED_FILE, data)
 
+def load_role_stats():
+    """Загружает статистику ролей"""
+    return load_json(ROLE_STATS_FILE, {
+        "role_changes": {},
+        "conflict_resolutions": {},
+        "total_changes": 0,
+        "last_reset": time.time()
+    })
+
+def save_role_stats(data):
+    """Сохраняет статистику ролей"""
+    save_json(ROLE_STATS_FILE, data)
+
+def update_role_stats(role_name: str, action: str, member_name: str):
+    """Обновляет статистику ролей"""
+    try:
+        stats = load_role_stats()
+        current_time = time.time()
+        
+        # Инициализируем структуру для роли
+        if role_name not in stats["role_changes"]:
+            stats["role_changes"][role_name] = {
+                "added": 0,
+                "removed": 0,
+                "conflicts": 0,
+                "last_activity": current_time
+            }
+        
+        # Обновляем статистику
+        if action == "added":
+            stats["role_changes"][role_name]["added"] += 1
+        elif action == "removed":
+            stats["role_changes"][role_name]["removed"] += 1
+        elif action == "conflict":
+            stats["role_changes"][role_name]["conflicts"] += 1
+            
+        stats["role_changes"][role_name]["last_activity"] = current_time
+        stats["total_changes"] += 1
+        
+        # Добавляем информацию о конфликтных разрешениях
+        if action == "conflict":
+            if role_name not in stats["conflict_resolutions"]:
+                stats["conflict_resolutions"][role_name] = []
+            
+            stats["conflict_resolutions"][role_name].append({
+                "user": member_name,
+                "timestamp": current_time
+            })
+            
+            # Ограничиваем историю конфликтов (последние 100)
+            if len(stats["conflict_resolutions"][role_name]) > 100:
+                stats["conflict_resolutions"][role_name] = stats["conflict_resolutions"][role_name][-100:]
+        
+        save_role_stats(stats)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении статистики ролей: {e}")
+
 # --------------------------
 # Reaction roles setup
 # --------------------------
 
-def check_role_conflicts(member: discord.Member, new_role_name: str) -> tuple[bool, str]:
+def get_conflicting_roles(member: discord.Member, new_role_name: str) -> tuple[list, str]:
     """
-    Проверяет конфликты ролей для пользователя (регистронезависимо).
-    Возвращает (можно_выдать_роль, сообщение_об_ошибке).
+    Находит конфликтующие роли для пользователя при получении новой роли.
+    Возвращает (список_ролей_для_снятия, сообщение_для_пользователя).
     """
     try:
-        new_role_l = new_role_name.strip().lower()
-        member_role_names_l = {r.name.strip().lower() for r in getattr(member, "roles", [])}
-
-        def conflicts_for(role_name: str) -> list[str]:
-            rn = role_name.strip().lower()
-            for key, values in CONFLICTING_ROLES.items():
-                if str(key).strip().lower() == rn:
-                    return list(values)
-            return []
-
-        def name_in_set(target: str, pool: set[str]) -> bool:
-            return target.strip().lower() in pool
-
-        # 1) Конфликты для новой роли: если у пользователя уже есть конфликтующая
-        for conflict_name in conflicts_for(new_role_name):
-            if name_in_set(conflict_name, member_role_names_l):
-                # Найдем красивое имя уже имеющейся конфликтующей роли для сообщения
-                existing_display = next((r.name for r in member.roles if r.name.strip().lower() == conflict_name.strip().lower()), conflict_name)
-                return False, f"❌ Нельзя получить роль **{new_role_name}**, так как у вас уже есть роль **{existing_display}**"
-
-        # 2) Конфликты от существующих ролей: если существующая роль конфликтует с новой
-        for existing_role in getattr(member, "roles", []):
-            for conflict_name in conflicts_for(existing_role.name):
-                if conflict_name.strip().lower() == new_role_l:
-                    return False, f"❌ Нельзя получить роль **{new_role_name}**, так как у вас уже есть роль **{existing_role.name}**"
-
-        return True, ""
-    except Exception:
-        # На всякий случай, если что-то пошло не так, не блокируем действие
-        return True, ""
+        conflicting_roles = []
+        member_roles = {r.name: r for r in member.roles}
+        new_role_priority = ROLE_PRIORITIES.get(new_role_name, 0)
+        
+        # Проверяем конфликты для новой роли
+        for conflict_name in CONFLICTING_ROLES.get(new_role_name, []):
+            if conflict_name in member_roles:
+                conflict_role = member_roles[conflict_name]
+                conflict_priority = ROLE_PRIORITIES.get(conflict_name, 0)
+                
+                # Если новая роль имеет более высокий приоритет, снимаем конфликтующую
+                if new_role_priority > conflict_priority:
+                    conflicting_roles.append(conflict_role)
+                else:
+                    # Если приоритет одинаковый или ниже, не выдаем новую роль
+                    return [], f"❌ Нельзя получить роль **{new_role_name}**, так как у вас уже есть роль **{conflict_name}** с таким же или более высоким приоритетом"
+        
+        # Проверяем конфликты от существующих ролей
+        for existing_role_name, existing_role in member_roles.items():
+            if existing_role_name in CONFLICTING_ROLES:
+                for conflict_name in CONFLICTING_ROLES[existing_role_name]:
+                    if conflict_name == new_role_name:
+                        existing_priority = ROLE_PRIORITIES.get(existing_role_name, 0)
+                        
+                        # Если существующая роль имеет более высокий приоритет, не выдаем новую
+                        if existing_priority >= new_role_priority:
+                            return [], f"❌ Нельзя получить роль **{new_role_name}**, так как у вас уже есть роль **{existing_role_name}** с более высоким приоритетом"
+                        else:
+                            # Если новая роль имеет более высокий приоритет, снимаем существующую
+                            conflicting_roles.append(existing_role)
+        
+        # Формируем сообщение для пользователя
+        if conflicting_roles:
+            conflicting_names = ", ".join(r.name for r in conflicting_roles)
+            message = f"⚠️ При получении роли **{new_role_name}** автоматически сняты конфликтующие роли: **{conflicting_names}**"
+        else:
+            message = f"✅ Роль **{new_role_name}** успешно выдана"
+            
+        return conflicting_roles, message
+        
+    except Exception as e:
+        logger.error(f"Ошибка при проверке конфликтующих ролей: {e}")
+        return [], f"❌ Ошибка при проверке ролей: {e}"
 
 async def ensure_roles_message(guild: discord.Guild, channel_id: int):
 	roles_data = load_reaction_roles()
@@ -257,51 +338,63 @@ async def handle_reaction_add(payload, bot):
 	if role_name:
 		role = discord.utils.get(guild.roles, name=role_name)
 		if role:
-			# Проверяем конфликты ролей
-			can_add_role, error_message = check_role_conflicts(member, role_name)
-			
-			if not can_add_role:
-				# Находим конфликтующие роли, которые нужно снять
-				conflicting_roles = []
-				member_role_names = {r.name for r in member.roles}
+			try:
+				# Получаем конфликтующие роли и сообщение
+				conflicting_roles, message = get_conflicting_roles(member, role_name)
 				
-				# Проверяем конфликты для новой роли
-				for conflict_name in CONFLICTING_ROLES.get(role_name, []):
-					if conflict_name in member_role_names:
-						conflict_role = discord.utils.get(guild.roles, name=conflict_name)
-						if conflict_role:
-							conflicting_roles.append(conflict_role)
+				# Если есть ошибка (нельзя выдать роль)
+				if not conflicting_roles and "❌" in message:
+					# Удаляем реакцию пользователя
+					try:
+						message_obj = await bot.get_channel(payload.channel_id).fetch_message(payload.message_id)
+						await message_obj.remove_reaction(payload.emoji, member)
+						logger.info(f"Отклонена попытка получения роли {role_name} пользователем {member}: {message}")
+						
+						# Отправляем личное сообщение пользователю
+						try:
+							await member.send(message)
+						except discord.Forbidden:
+							pass  # Личные сообщения закрыты
+						except Exception as e:
+							logger.error(f"Ошибка при отправке личного сообщения: {e}")
+					except Exception as e:
+						logger.error(f"Ошибка при удалении реакции: {e}")
+					return
 				
 				# Снимаем конфликтующие роли
 				if conflicting_roles:
-					try:
-						await member.remove_roles(*conflicting_roles)
-						conflicting_names = ", ".join(r.name for r in conflicting_roles)
-						logger.info(f"Сняты конфликтующие роли {conflicting_names} у пользователя {member} для получения роли {role_name}")
-						
-						# Отправляем уведомление пользователю
-						try:
-							await member.send(f"⚠️ При получении роли **{role_name}** автоматически сняты конфликтующие роли: **{conflicting_names}**")
-						except discord.Forbidden:
-							# Если личные сообщения закрыты, игнорируем
-							pass
-						except Exception as e:
-							logger.error(f"Ошибка при отправке уведомления: {e}")
-					except Exception as e:
-						logger.error(f"Ошибка при снятии конфликтующих ролей: {e}")
-						# Если не удалось снять конфликтующие роли, удаляем реакцию
-						try:
-							message = await bot.get_channel(payload.channel_id).fetch_message(payload.message_id)
-							await message.remove_reaction(payload.emoji, member)
-						except Exception as e2:
-							logger.error(f"Ошибка при удалении реакции: {e2}")
-						return
-			
-			try:
+					await member.remove_roles(*conflicting_roles)
+					conflicting_names = ", ".join(r.name for r in conflicting_roles)
+					logger.info(f"Сняты конфликтующие роли {conflicting_names} у пользователя {member} для получения роли {role_name}")
+					
+					# Обновляем статистику для снятых ролей
+					for removed_role in conflicting_roles:
+						update_role_stats(removed_role.name, "removed", str(member))
+						update_role_stats(removed_role.name, "conflict", str(member))
+				
+				# Выдаем новую роль
 				await member.add_roles(role)
 				logger.info(f"Выдана роль {role_name} пользователю {member}")
+				
+				# Обновляем статистику для новой роли
+				update_role_stats(role_name, "added", str(member))
+				
+				# Отправляем уведомление пользователю
+				try:
+					await member.send(message)
+				except discord.Forbidden:
+					pass  # Личные сообщения закрыты
+				except Exception as e:
+					logger.error(f"Ошибка при отправке уведомления: {e}")
+					
 			except Exception as e:
-				logger.error(f"Ошибка при выдаче роли: {e}")
+				logger.error(f"Ошибка при обработке роли {role_name} для пользователя {member}: {e}")
+				# Удаляем реакцию в случае ошибки
+				try:
+					message_obj = await bot.get_channel(payload.channel_id).fetch_message(payload.message_id)
+					await message_obj.remove_reaction(payload.emoji, member)
+				except Exception as e2:
+					logger.error(f"Ошибка при удалении реакции: {e2}")
 
 async def handle_reaction_remove(payload, bot):
 	msg_id = load_reaction_message_id()
@@ -323,6 +416,9 @@ async def handle_reaction_remove(payload, bot):
 				# Просто снимаем роль без дополнительных проверок
 				await member.remove_roles(role)
 				logger.info(f"Снята роль {role_name} у пользователя {member}")
+				
+				# Обновляем статистику
+				update_role_stats(role_name, "removed", str(member))
 			except Exception as e:
 				logger.error(f"Ошибка при снятии роли: {e}")
 

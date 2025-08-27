@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import time
 from logging.handlers import RotatingFileHandler
 from logging.handlers import TimedRotatingFileHandler
 from dotenv import load_dotenv
@@ -379,6 +380,52 @@ async def fix_roles_cmd(interaction: discord.Interaction):
             
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка при исправлении ролей: {e}", ephemeral=True)
+
+@bot.tree.command(name="role_stats", description="Показать статистику ролей")
+@admin_only()
+async def role_stats_cmd(interaction: discord.Interaction):
+    """Показывает статистику использования ролей"""
+    await ensure_deferred(interaction, ephemeral=True)
+    
+    try:
+        stats = handlers.load_role_stats()
+        
+        if not stats["role_changes"]:
+            await interaction.followup.send("📊 Статистика ролей пуста", ephemeral=True)
+            return
+        
+        # Формируем сообщение со статистикой
+        result_message = "📊 **Статистика ролей:**\n\n"
+        
+        # Сортируем роли по общему количеству изменений
+        role_totals = {}
+        for role_name, role_data in stats["role_changes"].items():
+            total = role_data["added"] + role_data["removed"]
+            role_totals[role_name] = total
+        
+        sorted_roles = sorted(role_totals.items(), key=lambda x: x[1], reverse=True)
+        
+        for role_name, total in sorted_roles:
+            role_data = stats["role_changes"][role_name]
+            result_message += f"**{role_name}:**\n"
+            result_message += f"  • Выдано: {role_data['added']}\n"
+            result_message += f"  • Снято: {role_data['removed']}\n"
+            result_message += f"  • Конфликтов: {role_data['conflicts']}\n"
+            result_message += f"  • Всего: {total}\n\n"
+        
+        result_message += f"**Общая статистика:**\n"
+        result_message += f"• Всего изменений: {stats['total_changes']}\n"
+        
+        # Добавляем информацию о последней активности
+        if stats["role_changes"]:
+            latest_role = max(stats["role_changes"].items(), key=lambda x: x[1]["last_activity"])
+            latest_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_role[1]["last_activity"]))
+            result_message += f"• Последняя активность: {latest_role[0]} ({latest_time})\n"
+        
+        await interaction.followup.send(result_message, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка при получении статистики: {e}", ephemeral=True)
 
 # =============================================================================
 # КОМАНДЫ ДЛЯ РАБОТЫ С ФОРУМОМ
