@@ -16,11 +16,10 @@ import traceback
 from discord.ext import tasks
 from bs4 import BeautifulSoup
 
-# Получаем логгер
+# Основной логгер и отдельный для парсинга форума
 logger = logging.getLogger("genesis_bot")
-
-# Получаем логгер
-logger = logging.getLogger("genesis_bot")
+forum_logger = logging.getLogger("genesis_bot.forum")
+orders_logger = logging.getLogger("genesis_bot.orders")
 
 # =============================================================================
 # КОНСТАНТЫ И НАСТРОЙКИ
@@ -34,6 +33,7 @@ NOTIFIED_FILE = "notified.json"                  # Уже отправленны
 
 # URL форума для мониторинга
 FORUM_URL = "https://forum.gta5rp.com/threads/sa-gov-postanovlenija-ofisa-generalnogo-prokurora-shtata-san-andreas.3311595"
+ORDERS_URL = "https://forum.gta5rp.com/threads/sa-gov-avtorizovannye-ordera-ofisa-generalnogo-prokurora.3311604"
 FORUM_BASE = "https://forum.gta5rp.com"
 
 # API ключ для YouTube
@@ -237,8 +237,8 @@ async def handle_reaction_add(payload, bot):
 			try:
 				await member.add_roles(role)
 				logger.info(f"Выдана роль {role_name} пользователю {member}")
-			except Exception:
-				traceback.print_exc()
+			except Exception as e:
+				logger.error(f"Ошибка при выдаче роли: {e}")
 
 async def handle_reaction_remove(payload, bot):
 	msg_id = load_reaction_message_id()
@@ -259,8 +259,8 @@ async def handle_reaction_remove(payload, bot):
 			try:
 				await member.remove_roles(role)
 				logger.info(f"Снята роль {role_name} у пользователя {member}")
-			except Exception:
-				traceback.print_exc()
+			except Exception as e:
+				logger.error(f"Ошибка при снятии роли: {e}")
 
 # --------------------------
 # Forum parsing + notifier (re-send if deleted)
@@ -278,7 +278,7 @@ async def parse_forum():
 			return BeautifulSoup(html, "html.parser")
 
 	async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-		logger.debug(f"🔍 Проверяем форум: {FORUM_URL}")
+		forum_logger.debug("�� Проверяем форум: %s", FORUM_URL)
 		soup = await fetch_soup(session, FORUM_URL)
 		if soup is None:
 			logger.error("❌ Не удалось загрузить страницу форума")
@@ -294,7 +294,7 @@ async def parse_forum():
 		thread_page_url = FORUM_URL
 		if last_page_href:
 			thread_page_url = urljoin(FORUM_BASE, last_page_href)
-			logger.debug(f"📄 Переходим на последнюю страницу: {thread_page_url}")
+			forum_logger.debug("📄 Переходим на последнюю страницу: %s", thread_page_url)
 			soup = await fetch_soup(session, thread_page_url)
 			if soup is None:
 				return None
@@ -305,7 +305,7 @@ async def parse_forum():
 			return None
 
 		last_post = posts[-1]
-		logger.debug(f"📝 Найдено сообщений: {len(posts)}")
+		forum_logger.debug("📝 Найдено сообщений: %d", len(posts))
 
 		post_id = None
 		for attr_name in ("id", "data-content"):
@@ -340,7 +340,85 @@ async def parse_forum():
 			text = (text[: max(0, max_len - 3)] + "...") if max_len >= 3 else text[:max_len]
 
 		result = {"text": text, "url": url, "post_id": post_id or url}
-		logger.debug(f"✅ Получен пост ID: {post_id}, URL: {url}")
+		forum_logger.debug("✅ Получен пост ID: %s, URL: %s", post_id, url)
+		return result
+
+async def parse_orders():
+	timeout = aiohttp.ClientTimeout(total=15)
+	headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+
+	async def fetch_soup(session, url):
+		async with session.get(url) as resp:
+			if resp.status != 200:
+				logger.error(f"Ошибка загрузки ордеров: {resp.status}")
+				return None
+			html = await resp.text()
+			return BeautifulSoup(html, "html.parser")
+
+	async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+		orders_logger.debug("🔍 Проверяем ордера: %s", ORDERS_URL)
+		soup = await fetch_soup(session, ORDERS_URL)
+		if soup is None:
+			logger.error("❌ Не удалось загрузить страницу ордеров")
+			return None
+
+		last_page_href = None
+		nav = soup.select_one("nav.pageNav") or soup
+		for a in nav.select("a[href*='page-']"):
+			m = re.search(r"page-(\d+)", a.get("href", ""))
+			if m:
+				last_page_href = a["href"]
+
+		thread_page_url = ORDERS_URL
+		if last_page_href:
+			thread_page_url = urljoin(FORUM_BASE, last_page_href)
+			orders_logger.debug("📄 Переходим на последнюю страницу: %s", thread_page_url)
+			soup = await fetch_soup(session, thread_page_url)
+			if soup is None:
+				return None
+
+		posts = soup.select("article.message")
+		if not posts:
+			logger.error("❌ Не найдено сообщений на странице ордеров")
+			return None
+
+		last_post = posts[-1]
+		orders_logger.debug("📝 Найдено сообщений: %d", len(posts))
+
+		post_id = None
+		for attr_name in ("id", "data-content"):
+			attr_val = last_post.get(attr_name) or ""
+			m = re.search(r"post-(\d+)", attr_val)
+			if m:
+				post_id = m.group(1)
+				break
+		if not post_id:
+			link = last_post.select_one("a[href*='#post-']")
+			if link and link.has_attr("href"):
+				m = re.search(r"#post-(\d+)", link["href"])
+				if m:
+					post_id = m.group(1)
+
+		url = thread_page_url
+		if post_id:
+			url = f"{thread_page_url}#post-{post_id}"
+
+		body = last_post.select_one(".message-content .bbWrapper") or last_post.select_one(".bbWrapper")
+		if body:
+			text = body.get_text("\n", strip=True)
+		else:
+			text = last_post.get_text(" ", strip=True)
+
+		text = re.sub(r"\s+\n", "\n", text)
+		text = re.sub(r"\n{3,}", "\n\n", text)
+
+		overhead = len("Новый ордер:\n") + len(url) + 2
+		max_len = max(0, 2000 - overhead)
+		if len(text) > max_len:
+			text = (text[: max(0, max_len - 3)] + "...") if max_len >= 3 else text[:max_len]
+
+		result = {"text": text, "url": url, "post_id": post_id or url}
+		orders_logger.debug("✅ Получен ордер ID: %s, URL: %s", post_id, url)
 		return result
 
 async def _forum_message_exists(channel: discord.TextChannel, url: str, text: str) -> bool:
@@ -352,7 +430,7 @@ async def _forum_message_exists(channel: discord.TextChannel, url: str, text: st
 @tasks.loop(minutes=5)
 async def check_forum(bot, forum_channel_id: int):
 	try:
-		logger.debug(f"🔄 Проверка форума (канал: {forum_channel_id})")
+		forum_logger.debug("🔄 Проверка форума (канал: %s)", forum_channel_id)
 		post = await parse_forum()
 		if not post:
 			logger.error("❌ Не удалось получить пост с форума")
@@ -369,7 +447,7 @@ async def check_forum(bot, forum_channel_id: int):
 		forum_state = notified.get("forum", {})
 		last_post_id = forum_state.get("last_post_id")
 
-		logger.debug(f"📊 Текущий ID поста: {post['post_id']}, Последний известный: {last_post_id}")
+		forum_logger.debug("📊 Текущий ID поста: %s, Последний известный: %s", post['post_id'], last_post_id)
 
 		if not exists and last_post_id != post["post_id"]:
 			logger.info(f"📢 Отправляем уведомление о новом посте: {post['post_id']}")
@@ -380,17 +458,61 @@ async def check_forum(bot, forum_channel_id: int):
 			logger.info("✅ Уведомление отправлено и сохранено")
 			return
 		elif exists:
-			logger.debug("ℹ️ Пост уже был отправлен ранее")
+			forum_logger.debug("ℹ️ Пост уже был отправлен ранее")
 		elif last_post_id == post["post_id"]:
-			logger.debug("ℹ️ Пост не изменился")
+			forum_logger.debug("ℹ️ Пост не изменился")
 
 		if last_post_id != post["post_id"]:
 			forum_state["last_post_id"] = post["post_id"]
 			notified["forum"] = forum_state
 			save_notified(notified)
-			logger.debug("📝 Обновлен ID последнего поста")
+			forum_logger.debug("📝 Обновлен ID последнего поста")
 	except Exception as e:
 		logger.error(f"❌ Ошибка при проверке форума: {e}")
+		traceback.print_exc()
+
+@tasks.loop(minutes=5)
+async def check_orders(bot, orders_channel_id: int):
+	try:
+		orders_logger.debug("🔄 Проверка ордеров (канал: %s)", orders_channel_id)
+		order = await parse_orders()
+		if not order:
+			logger.error("❌ Не удалось получить ордер")
+			return
+
+		channel = bot.get_channel(orders_channel_id)
+		if channel is None:
+			logger.error(f"❌ Канал {orders_channel_id} не найден")
+			return
+
+		exists = await _forum_message_exists(channel, order["url"], order["text"])
+
+		notified = load_notified()
+		orders_state = notified.get("orders", {})
+		last_order_id = orders_state.get("last_order_id")
+
+		orders_logger.debug("📊 Текущий ID ордера: %s, Последний известный: %s", order['post_id'], last_order_id)
+
+		if not exists and last_order_id != order["post_id"]:
+			logger.info(f"📢 Отправляем уведомление о новом ордере: {order['post_id']}")
+			await channel.send(f"Новый ордер:\n{order['url']}\n\n{order['text']}")
+			orders_state["last_order_id"] = order["post_id"]
+			notified["orders"] = orders_state
+			save_notified(notified)
+			logger.info("✅ Уведомление об ордере отправлено и сохранено")
+			return
+		elif exists:
+			orders_logger.debug("ℹ️ Ордер уже был отправлен ранее")
+		elif last_order_id == order["post_id"]:
+			orders_logger.debug("ℹ️ Ордер не изменился")
+
+		if last_order_id != order["post_id"]:
+			orders_state["last_order_id"] = order["post_id"]
+			notified["orders"] = orders_state
+			save_notified(notified)
+			orders_logger.debug("📝 Обновлен ID последнего ордера")
+	except Exception as e:
+		logger.error(f"❌ Ошибка при проверке ордеров: {e}")
 		traceback.print_exc()
 
 async def diagnose_forum(bot, forum_channel_id: int):
@@ -430,6 +552,39 @@ async def diagnose_forum(bot, forum_channel_id: int):
 		
 		return result
 		
+	except Exception as e:
+		return f"❌ Ошибка диагностики: {e}"
+
+async def diagnose_orders(bot, orders_channel_id: int):
+	"""Диагностика состояния ордеров"""
+	try:
+		# Проверяем канал
+		channel = bot.get_channel(orders_channel_id)
+		if channel is None:
+			return "❌ Канал ордеров не найден"
+		
+		channel_status = "✅ Доступен"
+		
+		# Проверяем последний ордер
+		notified = load_notified()
+		orders_state = notified.get("orders", {})
+		last_order_id = orders_state.get("last_order_id")
+		
+		# Пытаемся получить текущий ордер
+		try:
+			order = await parse_orders()
+			if order:
+				current_id = order.get("post_id", "неизвестен")
+				if last_order_id == current_id:
+					status_msg = "✅ Актуален"
+				else:
+					status_msg = f"⚠️ Обновление доступно (текущий: {current_id})"
+			else:
+				status_msg = "❌ Ошибка получения"
+		except Exception as e:
+			status_msg = f"❌ Ошибка: {e}"
+		
+		return f"Ордера: {status_msg} | Последний ордер: {last_order_id or 'неизвестен'} | Канал: {channel_status}"
 	except Exception as e:
 		return f"❌ Ошибка диагностики: {e}"
 
@@ -547,13 +702,13 @@ async def poll_twitch(bot, notifications_channel_id: int):
 			url = f"https://twitch.tv/{login}"
 			try:
 				await channel.send(f"В эфире на Twitch: {url}\n{title[:1900]}")
-			except Exception:
-				traceback.print_exc()
+			except Exception as e:
+				logger.error(f"Ошибка отправки сообщения Twitch: {e}")
 
 		notified["twitch"] = notified_twitch
 		save_notified(notified)
-	except Exception:
-		traceback.print_exc()
+	except Exception as e:
+		logger.error(f"Twitch loop error: {e}")
 
 async def twitch_check_and_notify(bot: discord.Client, notifications_channel_id: int, login: str):
 	login_norm = login.strip().lower()
@@ -588,8 +743,8 @@ async def twitch_check_and_notify(bot: discord.Client, notifications_channel_id:
 	try:
 		await channel.send(f"В эфире на Twitch: {url}\n{title[:1900]}")
 		return True, f"{login_norm}: live, отправлено уведомление."
-	except Exception:
-		traceback.print_exc()
+	except Exception as e:
+		logger.error(f"Ошибка отправки уведомления Twitch: {e}")
 		return False, f"{login_norm}: ошибка отправки уведомления."
 
 # --------------------------
@@ -691,13 +846,13 @@ async def poll_youtube(bot, notifications_channel_id: int):
 					url = f"https://youtu.be/{vid}"
 					try:
 						await channel.send(f"Новое видео на YouTube: {url}\n{title[:1900]}")
-					except Exception:
-						traceback.print_exc()
+					except Exception as e:
+						logger.error(f"Ошибка отправки сообщения YouTube: {e}")
 
 			notified["youtube"] = notified_youtube
 			save_notified(notified)
-	except Exception:
-		traceback.print_exc()
+	except Exception as e:
+		logger.error(f"YouTube loop error: {e}")
 
 async def youtube_check_and_notify(bot: discord.Client, notifications_channel_id: int, channel_input: str):
 	timeout = aiohttp.ClientTimeout(total=8)
@@ -732,8 +887,8 @@ async def youtube_check_and_notify(bot: discord.Client, notifications_channel_id
 	try:
 		await channel.send(f"Новое видео на YouTube: {url}\n{title}")
 		return True, f"{cid}: найдено новое видео, уведомление отправлено."
-	except Exception:
-		traceback.print_exc()
+	except Exception as e:
+		logger.error(f"Ошибка отправки уведомления YouTube: {e}")
 		return False, f"{cid}: ошибка отправки уведомления."
 
 def start_tracking_tasks(bot: discord.Client, notifications_channel_id: int):

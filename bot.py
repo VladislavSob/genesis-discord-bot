@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения ДО импорта handlers
@@ -17,76 +18,166 @@ import traceback
 # НАСТРОЙКА ЛОГГИРОВАНИЯ
 # =============================================================================
 
-# Создаем папку для логов если её нет
-os.makedirs("logs", exist_ok=True)
+def setup_logging():
+    """Настройка системы логирования"""
+    # Создаем папку для логов если её нет
+    os.makedirs("logs", exist_ok=True)
 
-# Настраиваем логгер
-logger = logging.getLogger("genesis_bot")
-logger.setLevel(logging.DEBUG)
+    # Полная очистка корневого логгера и установка уровня
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.WARNING)
 
-# Форматтер для логов
-formatter = logging.Formatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+    # Настраиваем логгер бота
+    logger = logging.getLogger("genesis_bot")
+    logger.setLevel(logging.DEBUG)
 
-# Хендлер для файла (ротация по размеру)
-file_handler = RotatingFileHandler(
-    "logs/genesis.log",
-    maxBytes=10*1024*1024,  # 10MB
-    backupCount=5,
-    encoding="utf-8"
-)
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(formatter)
+    # Форматтер для логов
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
 
-# Хендлер для консоли (только важные сообщения)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.WARNING)
-console_handler.setFormatter(formatter)
+    # Хендлер для файла (ротация по времени, хранить ~24 часа истории)
+    file_handler = TimedRotatingFileHandler(
+        "logs/genesis.log",
+        when="midnight",
+        interval=1,
+        backupCount=1,
+        encoding="utf-8",
+        utc=False
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
 
-# Добавляем хендлеры к логгеру
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+    # Хендлер для консоли (только важные сообщения)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(formatter)
 
-# Настраиваем логгер discord.py (убираем спам)
-discord_logger = logging.getLogger("discord")
-discord_logger.setLevel(logging.WARNING)
+    # Добавляем хендлеры к логгеру
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.propagate = False  # не пускать записи вверх к root
+
+    # Отдельный логгер для парсинга форума -> logs/forum.log
+    forum_logger = logging.getLogger("genesis_bot.forum")
+    forum_logger.setLevel(logging.DEBUG)
+    forum_logger.propagate = False
+
+    forum_handler = TimedRotatingFileHandler(
+        "logs/forum.log",
+        when="midnight",
+        interval=1,
+        backupCount=1,
+        encoding="utf-8",
+        utc=False
+    )
+    forum_handler.setLevel(logging.DEBUG)
+    forum_handler.setFormatter(formatter)
+    forum_logger.addHandler(forum_handler)
+
+    # Отдельный логгер для парсинга ордеров -> logs/orders.log
+    orders_logger = logging.getLogger("genesis_bot.orders")
+    orders_logger.setLevel(logging.DEBUG)
+    orders_logger.propagate = False
+
+    orders_handler = TimedRotatingFileHandler(
+        "logs/orders.log",
+        when="midnight",
+        interval=1,
+        backupCount=1,
+        encoding="utf-8",
+        utc=False
+    )
+    orders_handler.setLevel(logging.DEBUG)
+    orders_handler.setFormatter(formatter)
+    orders_logger.addHandler(orders_handler)
+
+    # Приглушаем логгеры discord.py и других библиотек и чистим их хендлеры
+    for name in ["discord", "discord.client", "discord.gateway", "discord.http",
+                 "aiohttp", "aiohttp.access", "aiohttp.client", "asyncio"]:
+        lib_logger = logging.getLogger(name)
+        lib_logger.handlers.clear()
+        lib_logger.setLevel(logging.ERROR)  # можно поставить WARNING при необходимости
+        lib_logger.propagate = False
+
+    return logger
+
+# Инициализируем логирование
+logger = setup_logging()
 
 # =============================================================================
 # КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # =============================================================================
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID_STR = os.getenv("GUILD_ID")
-ROLES_CHANNEL_ID_STR = os.getenv("ROLES_CHANNEL_ID")
-FORUM_CHANNEL_ID_STR = os.getenv("FORUM_CHANNEL_ID")
-NOTIFICATIONS_CHANNEL_ID_STR = os.getenv("NOTIFICATIONS_CHANNEL_ID")
+def load_environment():
+    """Загрузка и валидация переменных окружения"""
+    required_vars = {
+        "DISCORD_TOKEN": "Токен Discord бота",
+        "GUILD_ID": "ID сервера Discord",
+        "ROLES_CHANNEL_ID": "ID канала для ролей",
+        "FORUM_CHANNEL_ID": "ID канала для форума",
+        "NOTIFICATIONS_CHANNEL_ID": "ID канала для уведомлений",
+        "ORDERS_CHANNEL_ID": "ID канала для ордеров"
+    }
+    
+    config = {}
+    missing_vars = []
+    
+    for var_name, description in required_vars.items():
+        value = os.getenv(var_name)
+        if not value:
+            missing_vars.append(f"{var_name} ({description})")
+        else:
+            try:
+                # Конвертируем ID в целые числа
+                if var_name.endswith("_ID"):
+                    config[var_name] = int(value)
+                else:
+                    config[var_name] = value
+            except ValueError:
+                logger.error(f"❌ Неверный формат {var_name}: должно быть число")
+                missing_vars.append(var_name)
+    
+    if missing_vars:
+        logger.error("❌ Отсутствуют обязательные переменные окружения:")
+        for var in missing_vars:
+            logger.error(f"   - {var}")
+        raise SystemExit(1)
+    
+    logger.info("✅ Все обязательные переменные окружения загружены")
+    return config
 
-# Проверяем наличие всех необходимых переменных окружения
-if not TOKEN or not GUILD_ID_STR or not ROLES_CHANNEL_ID_STR or not FORUM_CHANNEL_ID_STR or not NOTIFICATIONS_CHANNEL_ID_STR:
-    logger.error("❌ Ошибка: Заполните все необходимые переменные в .env файле:")
-    logger.error("   - DISCORD_TOKEN")
-    logger.error("   - GUILD_ID") 
-    logger.error("   - ROLES_CHANNEL_ID")
-    logger.error("   - FORUM_CHANNEL_ID")
-    logger.error("   - NOTIFICATIONS_CHANNEL_ID")
-    raise SystemExit(1)
-
-# Конвертируем строковые ID в целые числа
-GUILD_ID = int(GUILD_ID_STR)
-ROLES_CHANNEL_ID = int(ROLES_CHANNEL_ID_STR)
-FORUM_CHANNEL_ID = int(FORUM_CHANNEL_ID_STR)
-NOTIFICATIONS_CHANNEL_ID = int(NOTIFICATIONS_CHANNEL_ID_STR)
+# Загружаем конфигурацию
+config = load_environment()
+TOKEN = config["DISCORD_TOKEN"]
+GUILD_ID = config["GUILD_ID"]
+ROLES_CHANNEL_ID = config["ROLES_CHANNEL_ID"]
+FORUM_CHANNEL_ID = config["FORUM_CHANNEL_ID"]
+NOTIFICATIONS_CHANNEL_ID = config["NOTIFICATIONS_CHANNEL_ID"]
+ORDERS_CHANNEL_ID = config["ORDERS_CHANNEL_ID"]
 
 # =============================================================================
 # НАСТРОЙКА INTENTS
 # =============================================================================
 
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-intents.reactions = True
+def setup_intents():
+    """Настройка Discord intents"""
+    intents = discord.Intents.default()
+    intents.members = True
+    intents.message_content = True
+    intents.reactions = True
+    return intents
+
+# =============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ХЕЛПЕРЫ
+# =============================================================================
+
+async def ensure_deferred(interaction: discord.Interaction, *, ephemeral: bool = True):
+    """Безопасно подтверждает взаимодействие, если оно ещё не подтверждено."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=ephemeral)
 
 # =============================================================================
 # ФУНКЦИИ ПРОВЕРКИ ПРАВ ДОСТУПА
@@ -118,6 +209,14 @@ def admin_only():
 class GenesisBot(commands.Bot):
     """Основной класс бота Genesis"""
     
+    def __init__(self):
+        super().__init__(
+            command_prefix="!",
+            intents=setup_intents(),
+            help_command=None  # Отключаем встроенную команду help
+        )
+        self.logger = logger
+    
     async def setup_hook(self) -> None:
         """Инициализация бота при запуске"""
         try:
@@ -126,44 +225,46 @@ class GenesisBot(commands.Bot):
             guild_obj = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild_obj)
             await self.tree.sync(guild=guild_obj)
-            logger.info("✅ Слэш-команды успешно синхронизированы")
+            self.logger.info("✅ Слэш-команды успешно синхронизированы")
         except Exception as e:
-            logger.error(f"❌ Ошибка при синхронизации команд: {e}")
+            self.logger.error(f"❌ Ошибка при синхронизации команд: {e}")
             traceback.print_exc()
 
 # Создаем экземпляр бота
-bot = GenesisBot(command_prefix="!", intents=intents)
+bot = GenesisBot()
 
 # =============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =============================================================================
 
-async def _log_channel_perms(bot_client: discord.Client, channel_id: int, label: str):
-    """Логирует права бота в указанном канале"""
+async def check_channel_permissions(channel_id: int, label: str) -> bool:
+    """Проверяет права бота в указанном канале"""
     try:
-        channel = bot_client.get_channel(channel_id)
+        channel = bot.get_channel(channel_id)
         if channel is None:
             logger.warning(f"⚠️  {label}: Канал {channel_id} не найден")
-            return
+            return False
         
         # Проверяем, что канал имеет guild (серверный канал)
         if not hasattr(channel, 'guild') or channel.guild is None:
             logger.warning(f"⚠️  {label}: Канал {channel_id} не является серверным каналом")
-            return
+            return False
             
         # Получаем права бота в канале
         permissions = channel.permissions_for(channel.guild.me)
-        if permissions.send_messages and permissions.view_channel:
-            logger.info(f"✅ {label}: Права в порядке")
-        else:
-            missing_perms = []
-            if not permissions.view_channel:
-                missing_perms.append("View Channel")
-            if not permissions.send_messages:
-                missing_perms.append("Send Messages")
-            logger.warning(f"⚠️  {label}: Недостаточно прав. Дайте роли бота View Channel и Send Messages в этом канале.")
+        required_perms = ["view_channel", "send_messages"]
+        missing_perms = [perm for perm in required_perms if not getattr(permissions, perm)]
+        
+        if missing_perms:
+            logger.warning(f"⚠️  {label}: Недостаточно прав: {', '.join(missing_perms)}")
+            return False
+        
+        logger.info(f"✅ {label}: Права в порядке")
+        return True
+        
     except Exception as e:
         logger.error(f"❌ {label}: Ошибка проверки прав: {e}")
+        return False
 
 # =============================================================================
 # СОБЫТИЯ БОТА
@@ -174,15 +275,19 @@ async def on_ready():
     """Событие запуска бота"""
     logger.info(f"🤖 Бот {bot.user} успешно запущен!")
     logger.info(f"🆔 ID бота: {bot.user.id}")
-    logger.info(f"🏠 Сервер: {bot.get_guild(GUILD_ID).name if bot.get_guild(GUILD_ID) else 'Не найден'}")
+    
+    guild = bot.get_guild(GUILD_ID)
+    if guild:
+        logger.info(f"🏠 Сервер: {guild.name}")
+    else:
+        logger.warning(f"⚠️  Сервер {GUILD_ID} не найден")
 
     # Диагностика прав в каналах
     logger.info("🔍 Проверка прав доступа к каналам:")
-    await _log_channel_perms(bot, NOTIFICATIONS_CHANNEL_ID, "Notifications")
-    await _log_channel_perms(bot, FORUM_CHANNEL_ID, "Forum")
-
-    # Получаем объект гильдии
-    guild = bot.get_guild(GUILD_ID) or await bot.fetch_guild(GUILD_ID)
+    await check_channel_permissions(NOTIFICATIONS_CHANNEL_ID, "Notifications")
+    await check_channel_permissions(FORUM_CHANNEL_ID, "Forum")
+    await check_channel_permissions(ROLES_CHANNEL_ID, "Roles")
+    await check_channel_permissions(ORDERS_CHANNEL_ID, "Orders")
 
     # Инициализируем сообщение с ролями
     try:
@@ -195,6 +300,11 @@ async def on_ready():
     if not handlers.check_forum.is_running():
         handlers.check_forum.start(bot, FORUM_CHANNEL_ID)
         logger.info("✅ Проверка форума запущена")
+
+    # Запускаем проверку ордеров, если она еще не запущена
+    if not handlers.check_orders.is_running():
+        handlers.check_orders.start(bot, ORDERS_CHANNEL_ID)
+        logger.info("✅ Проверка ордеров запущена")
 
     # Запускаем отслеживание стримов и видео
     handlers.start_tracking_tasks(bot, NOTIFICATIONS_CHANNEL_ID)
@@ -219,7 +329,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 @admin_only()
 async def sync_cmd(interaction: discord.Interaction):
     """Пересинхронизирует слэш-команды"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         await bot.tree.sync()
@@ -244,7 +354,7 @@ async def sync_cmd(interaction: discord.Interaction):
 @admin_only()
 async def force_forum_check(interaction: discord.Interaction):
     """Принудительно проверяет форум и показывает последний пост"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         post = await handlers.parse_forum()
@@ -262,10 +372,44 @@ async def force_forum_check(interaction: discord.Interaction):
 @admin_only()
 async def forum_diagnose(interaction: discord.Interaction):
     """Показывает диагностическую информацию о состоянии форума"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         result = await handlers.diagnose_forum(bot, FORUM_CHANNEL_ID)
+        await interaction.followup.send(f"🔍 {result}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка диагностики: {e}", ephemeral=True)
+
+# =============================================================================
+# КОМАНДЫ ДЛЯ РАБОТЫ С ОРДЕРАМИ
+# =============================================================================
+
+@bot.tree.command(name="force_orders_check", description="Проверить ордера вручную")
+@admin_only()
+async def force_orders_check(interaction: discord.Interaction):
+    """Принудительно проверяет ордера и показывает последний ордер"""
+    await ensure_deferred(interaction, ephemeral=True)
+    
+    try:
+        order = await handlers.parse_orders()
+        if order and order.get("text"):
+            await interaction.followup.send(
+                f"📋 Последний ордер:\n{order['url']}\n\n{order['text']}", 
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send("❌ Не удалось получить ордер.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
+
+@bot.tree.command(name="orders_diagnose", description="Диагностика состояния ордеров")
+@admin_only()
+async def orders_diagnose(interaction: discord.Interaction):
+    """Показывает диагностическую информацию о состоянии ордеров"""
+    await ensure_deferred(interaction, ephemeral=True)
+    
+    try:
+        result = await handlers.diagnose_orders(bot, ORDERS_CHANNEL_ID)
         await interaction.followup.send(f"🔍 {result}", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка диагностики: {e}", ephemeral=True)
@@ -278,7 +422,7 @@ async def forum_diagnose(interaction: discord.Interaction):
 @admin_only()
 async def twitch_add(interaction: discord.Interaction, login: str):
     """Добавляет Twitch-канал в список отслеживаемых"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         success, message = handlers.add_twitch_channel(login)
@@ -290,7 +434,7 @@ async def twitch_add(interaction: discord.Interaction, login: str):
 @admin_only()
 async def twitch_remove(interaction: discord.Interaction, login: str):
     """Удаляет Twitch-канал из списка отслеживаемых"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         success, message = handlers.remove_twitch_channel(login)
@@ -302,7 +446,7 @@ async def twitch_remove(interaction: discord.Interaction, login: str):
 @admin_only()
 async def twitch_list(interaction: discord.Interaction):
     """Показывает список всех отслеживаемых Twitch-каналов"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         channels = handlers.list_twitch_channels()
@@ -318,7 +462,7 @@ async def twitch_list(interaction: discord.Interaction):
 @admin_only()
 async def twitch_check(interaction: discord.Interaction, login: str):
     """Проверяет Twitch-канал и отправляет уведомление если онлайн"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         success, message = await handlers.twitch_check_and_notify(bot, NOTIFICATIONS_CHANNEL_ID, login)
@@ -334,7 +478,7 @@ async def twitch_check(interaction: discord.Interaction, login: str):
 @admin_only()
 async def youtube_add(interaction: discord.Interaction, channel: str):
     """Добавляет YouTube-канал в список отслеживаемых"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         success, message = await handlers.add_youtube_channel(channel)
@@ -346,7 +490,7 @@ async def youtube_add(interaction: discord.Interaction, channel: str):
 @admin_only()
 async def youtube_remove(interaction: discord.Interaction, channel: str):
     """Удаляет YouTube-канал из списка отслеживаемых"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         success, message = await handlers.remove_youtube_channel(channel)
@@ -358,7 +502,7 @@ async def youtube_remove(interaction: discord.Interaction, channel: str):
 @admin_only()
 async def youtube_list(interaction: discord.Interaction):
     """Показывает список всех отслеживаемых YouTube-каналов"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         channels = handlers.list_youtube_channels()
@@ -374,7 +518,7 @@ async def youtube_list(interaction: discord.Interaction):
 @admin_only()
 async def youtube_check(interaction: discord.Interaction, channel: str):
     """Проверяет YouTube-канал и отправляет уведомление если есть новое видео"""
-    await interaction.response.defer(ephemeral=True)
+    await ensure_deferred(interaction, ephemeral=True)
     
     try:
         success, message = await handlers.youtube_check_and_notify(bot, NOTIFICATIONS_CHANNEL_ID, channel)
