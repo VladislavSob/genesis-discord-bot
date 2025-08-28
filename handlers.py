@@ -21,6 +21,16 @@ logger = logging.getLogger("genesis_bot")
 forum_logger = logging.getLogger("genesis_bot.forum")
 orders_logger = logging.getLogger("genesis_bot.orders")
 
+# Общая блокировка на операции с JSON-файлами состояния
+json_lock = asyncio.Lock()
+
+# Блокировки для обработки реакций пользователей (предотвращает одновременную обработку)
+user_reaction_locks = {}
+user_locks_lock = asyncio.Lock()
+
+# Глобальная блокировка для всех операций с ролями
+global_roles_lock = asyncio.Lock()
+
 # =============================================================================
 # КОНСТАНТЫ И НАСТРОЙКИ
 # =============================================================================
@@ -32,9 +42,15 @@ TRACKING_FILE = "channels.json"                  # Отслеживаемые к
 NOTIFIED_FILE = "notified.json"                  # Уже отправленные уведомления
 
 # URL форума для мониторинга
-FORUM_URL = "https://forum.gta5rp.com/threads/sa-gov-postanovlenija-ofisa-generalnogo-prokurora-shtata-san-andreas.3311595"
-ORDERS_URL = "https://forum.gta5rp.com/threads/sa-gov-avtorizovannye-ordera-ofisa-generalnogo-prokurora.3311604"
-FORUM_BASE = "https://forum.gta5rp.com"
+FORUM_URL = os.getenv(
+    "FORUM_URL",
+    "https://forum.gta5rp.com/threads/sa-gov-postanovlenija-ofisa-generalnogo-prokurora-shtata-san-andreas.3311595",
+)
+ORDERS_URL = os.getenv(
+    "ORDERS_URL",
+    "https://forum.gta5rp.com/threads/sa-gov-avtorizovannye-ordera-ofisa-generalnogo-prokurora.3311604",
+)
+FORUM_BASE = os.getenv("FORUM_BASE", "https://forum.gta5rp.com")
 
 # API ключ для YouTube
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
@@ -83,6 +99,23 @@ def save_tracking(data):
     """Сохраняет список отслеживаемых каналов"""
     save_json(TRACKING_FILE, data)
 
+# Асинхронные, защищенные версии доступа к JSON-состоянию
+async def async_load_notified():
+    async with json_lock:
+        return load_notified()
+
+async def async_save_notified(data):
+    async with json_lock:
+        save_notified(data)
+
+async def async_load_tracking():
+    async with json_lock:
+        return load_tracking()
+
+async def async_save_tracking(data):
+    async with json_lock:
+        save_tracking(data)
+
 def load_notified():
     """Загружает список уже отправленных уведомлений"""
     return load_json(NOTIFIED_FILE, {"twitch": {}, "youtube": {}, "forum": {}})
@@ -90,6 +123,24 @@ def load_notified():
 def save_notified(data):
     """Сохраняет список уже отправленных уведомлений"""
     save_json(NOTIFIED_FILE, data)
+
+async def get_user_reaction_lock(user_id: int) -> asyncio.Lock:
+    """Получает блокировку для обработки реакций конкретного пользователя"""
+    async with user_locks_lock:
+        if user_id not in user_reaction_locks:
+            user_reaction_locks[user_id] = asyncio.Lock()
+        return user_reaction_locks[user_id]
+
+async def cleanup_old_user_locks():
+    """Очищает старые блокировки пользователей (вызывается периодически)"""
+    async with user_locks_lock:
+        # Оставляем только активные блокировки (не заблокированные)
+        active_locks = {}
+        for user_id, lock in user_reaction_locks.items():
+            if not lock.locked():
+                active_locks[user_id] = lock
+        user_reaction_locks.clear()
+        user_reaction_locks.update(active_locks)
 
 # --------------------------
 # Reaction roles setup
@@ -101,6 +152,7 @@ def check_role_conflicts(member: discord.Member, new_role_name: str) -> tuple[bo
     Возвращает (можно_выдать_роль, сообщение_об_ошибке).
     """
     try:
+        # Обновляем список ролей пользователя (на случай, если они изменились)
         member_role_names = {r.name for r in member.roles}
         
         # Проверяем конфликты для новой роли
@@ -230,38 +282,78 @@ async def handle_reaction_add(payload, bot):
 	else:
 		member = payload.member
 
+	# Используем глобальную блокировку для всех операций с ролями
+	async with global_roles_lock:
+		# Добавляем небольшую задержку для стабилизации
+		await asyncio.sleep(0.1)
+		
+		# Обновляем информацию о пользователе (на случай, если роли изменились)
+		try:
+			member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+		except Exception:
+			return
+			
+		await _process_reaction_add(payload, bot, member, roles_data, guild)
+
+async def _process_reaction_add(payload, bot, member, roles_data, guild):
+	"""Внутренняя функция для обработки добавления реакции"""
 	emoji = str(payload.emoji)
 	role_name = roles_data.get(emoji)
-	if role_name:
-		role = discord.utils.get(guild.roles, name=role_name)
-		if role:
-			# Проверяем конфликты ролей
-			can_add_role, error_message = check_role_conflicts(member, role_name)
-			
-			if not can_add_role:
-				# Удаляем реакцию пользователя, так как роль не может быть выдана
+	if not role_name:
+		return
+		
+	role = discord.utils.get(guild.roles, name=role_name)
+	if not role:
+		return
+
+	# Проверяем конфликты ролей
+	can_add_role, error_message = check_role_conflicts(member, role_name)
+	
+	if not can_add_role:
+		# Удаляем реакцию пользователя, так как роль не может быть выдана
+		try:
+			channel = bot.get_channel(payload.channel_id)
+			if channel is None:
 				try:
-					message = await bot.get_channel(payload.channel_id).fetch_message(payload.message_id)
-					await message.remove_reaction(payload.emoji, member)
-					logger.info(f"Отклонена попытка получения роли {role_name} пользователем {member}: {error_message}")
-					
-					# Отправляем личное сообщение пользователю
-					try:
-						await member.send(error_message)
-					except discord.Forbidden:
-						# Если личные сообщения закрыты, игнорируем
-						pass
-					except Exception as e:
-						logger.error(f"Ошибка при отправке личного сообщения: {e}")
-				except Exception as e:
-					logger.error(f"Ошибка при удалении реакции: {e}")
+					channel = await bot.fetch_channel(payload.channel_id)  # type: ignore[attr-defined]
+				except Exception:
+					channel = None
+			if channel is None:
 				return
+			message = await channel.fetch_message(payload.message_id)  # type: ignore[union-attr]
+			await message.remove_reaction(payload.emoji, member)
+			logger.info(f"Отклонена попытка получения роли {role_name} пользователем {member}: {error_message}")
 			
+			# Отправляем личное сообщение пользователю
 			try:
-				await member.add_roles(role)
-				logger.info(f"Выдана роль {role_name} пользователю {member}")
+				await member.send(error_message)
+			except discord.Forbidden:
+				# Если личные сообщения закрыты, игнорируем
+				pass
 			except Exception as e:
-				logger.error(f"Ошибка при выдаче роли: {e}")
+				logger.error(f"Ошибка при отправке личного сообщения: {e}")
+		except Exception as e:
+			logger.error(f"Ошибка при удалении реакции: {e}")
+		return
+	
+	try:
+		# Автоматически снимаем конфликтующие роли перед выдачей новой
+		conflicts_to_remove = []
+		for conflict_name in CONFLICTING_ROLES.get(role_name, []):
+			conflict_role = discord.utils.get(guild.roles, name=conflict_name)
+			if conflict_role and conflict_role in member.roles:
+				conflicts_to_remove.append(conflict_role)
+		
+		if conflicts_to_remove:
+			await member.remove_roles(*conflicts_to_remove)
+			conflict_names = ", ".join([r.name for r in conflicts_to_remove])
+			logger.info(f"Автоматически сняты конфликтующие роли {conflict_names} у пользователя {member} для получения роли {role_name}")
+		
+		# Выдаем роль
+		await member.add_roles(role)
+		logger.info(f"Выдана роль {role_name} пользователю {member}")
+	except Exception as e:
+		logger.error(f"Ошибка при выдаче роли: {e}")
 
 async def handle_reaction_remove(payload, bot):
 	msg_id = load_reaction_message_id()
@@ -273,18 +365,32 @@ async def handle_reaction_remove(payload, bot):
 	if guild is None:
 		return
 
+	# Используем глобальную блокировку для всех операций с ролями
+	async with global_roles_lock:
+		# Добавляем небольшую задержку для стабилизации
+		await asyncio.sleep(0.1)
+		
+		await _process_reaction_remove(payload, bot, roles_data, guild)
+
+async def _process_reaction_remove(payload, bot, roles_data, guild):
+	"""Внутренняя функция для обработки снятия реакции"""
 	emoji = str(payload.emoji)
 	role_name = roles_data.get(emoji)
-	if role_name:
-		role = discord.utils.get(guild.roles, name=role_name)
-		member = guild.get_member(payload.user_id)
-		if role and member:
-			try:
-				# Просто снимаем роль без дополнительных проверок
-				await member.remove_roles(role)
-				logger.info(f"Снята роль {role_name} у пользователя {member}")
-			except Exception as e:
-				logger.error(f"Ошибка при снятии роли: {e}")
+	if not role_name:
+		return
+		
+	role = discord.utils.get(guild.roles, name=role_name)
+	member = guild.get_member(payload.user_id)
+	if not role or not member:
+		return
+		
+	try:
+		# Снимаем только запрошенную роль, не трогаем другие
+		await member.remove_roles(role)
+		logger.info(f"Снята роль {role_name} у пользователя {member}")
+			
+	except Exception as e:
+		logger.error(f"Ошибка при снятии роли: {e}")
 
 # --------------------------
 # Forum parsing + notifier (re-send if deleted)
@@ -302,7 +408,7 @@ async def parse_forum():
 			return BeautifulSoup(html, "html.parser")
 
 	async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-		forum_logger.debug("�� Проверяем форум: %s", FORUM_URL)
+		forum_logger.debug("🔍 Проверяем форум: %s", FORUM_URL)
 		soup = await fetch_soup(session, FORUM_URL)
 		if soup is None:
 			logger.error("❌ Не удалось загрузить страницу форума")
@@ -467,7 +573,7 @@ async def check_forum(bot, forum_channel_id: int):
 
 		exists = await _forum_message_exists(channel, post["url"], post["text"])
 
-		notified = load_notified()
+		notified = await async_load_notified()
 		forum_state = notified.get("forum", {})
 		last_post_id = forum_state.get("last_post_id")
 
@@ -478,7 +584,7 @@ async def check_forum(bot, forum_channel_id: int):
 			await channel.send(f"Новое постановление:\n{post['url']}")
 			forum_state["last_post_id"] = post["post_id"]
 			notified["forum"] = forum_state
-			save_notified(notified)
+			await async_save_notified(notified)
 			logger.info("✅ Уведомление отправлено и сохранено")
 			return
 		elif exists:
@@ -489,7 +595,7 @@ async def check_forum(bot, forum_channel_id: int):
 		if last_post_id != post["post_id"]:
 			forum_state["last_post_id"] = post["post_id"]
 			notified["forum"] = forum_state
-			save_notified(notified)
+			await async_save_notified(notified)
 			forum_logger.debug("📝 Обновлен ID последнего поста")
 	except Exception as e:
 		logger.error(f"❌ Ошибка при проверке форума: {e}")
@@ -511,7 +617,7 @@ async def check_orders(bot, orders_channel_id: int):
 
 		exists = await _forum_message_exists(channel, order["url"], order["text"])
 
-		notified = load_notified()
+		notified = await async_load_notified()
 		orders_state = notified.get("orders", {})
 		last_order_id = orders_state.get("last_order_id")
 
@@ -522,7 +628,7 @@ async def check_orders(bot, orders_channel_id: int):
 			await channel.send(f"Новый ордер:\n{order['url']}")
 			orders_state["last_order_id"] = order["post_id"]
 			notified["orders"] = orders_state
-			save_notified(notified)
+			await async_save_notified(notified)
 			logger.info("✅ Уведомление об ордере отправлено и сохранено")
 			return
 		elif exists:
@@ -533,7 +639,7 @@ async def check_orders(bot, orders_channel_id: int):
 		if last_order_id != order["post_id"]:
 			orders_state["last_order_id"] = order["post_id"]
 			notified["orders"] = orders_state
-			save_notified(notified)
+			await async_save_notified(notified)
 			orders_logger.debug("📝 Обновлен ID последнего ордера")
 	except Exception as e:
 		logger.error(f"❌ Ошибка при проверке ордеров: {e}")
@@ -560,7 +666,7 @@ async def diagnose_forum(bot, forum_channel_id: int):
 			return "❌ Не удалось получить данные с форума"
 		
 		# Проверяем состояние уведомлений
-		notified = load_notified()
+		notified = await async_load_notified()
 		forum_state = notified.get("forum", {})
 		last_post_id = forum_state.get("last_post_id")
 		
@@ -590,7 +696,7 @@ async def diagnose_orders(bot, orders_channel_id: int):
 		channel_status = "✅ Доступен"
 		
 		# Проверяем последний ордер
-		notified = load_notified()
+		notified = await async_load_notified()
 		orders_state = notified.get("orders", {})
 		last_order_id = orders_state.get("last_order_id")
 		
@@ -690,10 +796,46 @@ def _missing_send_perms(channel) -> list[str]:
 	except Exception:
 		return ["unknown"]
 
+@tasks.loop(minutes=5)  # Проверяем конфликтующие роли каждые 5 минут
+async def check_conflicting_roles(bot):
+    """Периодическая проверка конфликтующих ролей (только логирование)"""
+    try:
+        # Очищаем старые блокировки пользователей
+        await cleanup_old_user_locks()
+        
+        for guild in bot.guilds:
+            violations_count = 0
+            for member in guild.members:
+                if member.bot:
+                    continue
+                    
+                member_roles = list(member.roles)
+                conflicts_found = []
+                
+                # Проверяем каждую роль пользователя на конфликты
+                for role in member_roles:
+                    if role.name in CONFLICTING_ROLES:
+                        for conflict_name in CONFLICTING_ROLES[role.name]:
+                            conflict_role = discord.utils.get(guild.roles, name=conflict_name)
+                            if conflict_role and conflict_role in member_roles:
+                                conflicts_found.append((role.name, conflict_name))
+                
+                # Только логируем нарушения, не исправляем автоматически
+                if conflicts_found:
+                    for role1, role2 in conflicts_found:
+                        logger.warning(f"Обнаружены конфликтующие роли у {member}: {role1} и {role2}")
+                    violations_count += 1
+            
+            if violations_count > 0:
+                logger.info(f"Обнаружено {violations_count} пользователей с конфликтующими ролями в сервере {guild.name}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка при проверке конфликтующих ролей: {e}")
+
 @tasks.loop(seconds=120)  # Изменено с 10 секунд на 2 минуты
 async def poll_twitch(bot, notifications_channel_id: int):
 	try:
-		tracking = load_tracking()
+		tracking = await async_load_tracking()
 		logins = tracking.get("twitch", [])
 		if not logins:
 			return
@@ -711,7 +853,7 @@ async def poll_twitch(bot, notifications_channel_id: int):
 			logger.warning(f"Twitch: нет прав в канале уведомлений ({notifications_channel_id}): {', '.join(missing)}")
 			return
 
-		notified = load_notified()
+		notified = await async_load_notified()
 		notified_twitch = notified.get("twitch", {})
 
 		for stream in live_streams:
@@ -730,7 +872,7 @@ async def poll_twitch(bot, notifications_channel_id: int):
 				logger.error(f"Ошибка отправки сообщения Twitch: {e}")
 
 		notified["twitch"] = notified_twitch
-		save_notified(notified)
+		await async_save_notified(notified)
 	except Exception as e:
 		logger.error(f"Twitch loop error: {e}")
 
@@ -755,14 +897,14 @@ async def twitch_check_and_notify(bot: discord.Client, notifications_channel_id:
 	if missing:
 		return False, f"Недостаточно прав в канале уведомлений: {', '.join(missing)}"
 
-	notified = load_notified()
+	notified = await async_load_notified()
 	notified_twitch = notified.get("twitch", {})
 	if notified_twitch.get(login_norm) == stream_id:
 		return True, f"{login_norm}: уже уведомлено для текущего эфира ({stream_id})."
 
 	notified_twitch[login_norm] = stream_id
 	notified["twitch"] = notified_twitch
-	save_notified(notified)
+	await async_save_notified(notified)
 
 	try:
 		await channel.send(f"В эфире на Twitch: {url}\n{title[:1900]}")
@@ -841,14 +983,14 @@ async def poll_youtube(bot, notifications_channel_id: int):
 	try:
 		if not YOUTUBE_API_KEY:
 			return
-		tracking = load_tracking()
+		tracking = await async_load_tracking()
 		channels = tracking.get("youtube", [])
 		if not channels:
 			return
 
 		timeout = aiohttp.ClientTimeout(total=8)
 		async with aiohttp.ClientSession(timeout=timeout) as session:
-			notified = load_notified()
+			notified = await async_load_notified()
 			notified_youtube = notified.get("youtube", {})
 			channel = bot.get_channel(notifications_channel_id)
 			if channel is None:
@@ -856,6 +998,7 @@ async def poll_youtube(bot, notifications_channel_id: int):
 
 			missing = _missing_send_perms(channel)
 			if missing:
+				logger.warning(f"YouTube: нет прав в канале уведомлений ({notifications_channel_id}): {', '.join(missing)}")
 				return
 
 			for channel_id in channels:
@@ -874,7 +1017,7 @@ async def poll_youtube(bot, notifications_channel_id: int):
 						logger.error(f"Ошибка отправки сообщения YouTube: {e}")
 
 			notified["youtube"] = notified_youtube
-			save_notified(notified)
+			await async_save_notified(notified)
 	except Exception as e:
 		logger.error(f"YouTube loop error: {e}")
 
@@ -897,14 +1040,14 @@ async def youtube_check_and_notify(bot: discord.Client, notifications_channel_id
 	if missing:
 		return False, f"Недостаточно прав в канале уведомлений: {', '.join(missing)}"
 
-	notified = load_notified()
+	notified = await async_load_notified()
 	notified_youtube = notified.get("youtube", {})
 	if notified_youtube.get(cid) == latest["video_id"]:
 		return True, f"{cid}: уже уведомлено об этом видео ({latest['video_id']})."
 
 	notified_youtube[cid] = latest["video_id"]
 	notified["youtube"] = notified_youtube
-	save_notified(notified)
+	await async_save_notified(notified)
 
 	url = f"https://youtu.be/{latest['video_id']}"
 	title = latest.get("title", "")[:1900]
@@ -925,27 +1068,27 @@ def start_tracking_tasks(bot: discord.Client, notifications_channel_id: int):
 # Manage tracking lists
 # --------------------------
 def add_twitch_channel(login: str):
-	login_norm = login.strip().lower()
-	if not re.fullmatch(r"[a-z0-9_]{3,25}", login_norm):
-		return False, "Некорректный Twitch-логин."
-	data = load_tracking()
-	if login_norm in data["twitch"]:
-		return False, "Такой Twitch-канал уже добавлен."
-	data["twitch"].append(login_norm)
-	save_tracking(data)
-	return True, f"Twitch-канал добавлен: {login_norm}"
+    login_norm = login.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{3,25}", login_norm):
+        return False, "Некорректный Twitch-логин."
+    data = load_tracking()
+    if login_norm in data["twitch"]:
+        return False, "Такой Twitch-канал уже добавлен."
+    data["twitch"].append(login_norm)
+    save_tracking(data)
+    return True, f"Twitch-канал добавлен: {login_norm}"
 
 def remove_twitch_channel(login: str):
-	login_norm = login.strip().lower()
-	data = load_tracking()
-	if login_norm not in data["twitch"]:
-		return False, "Такого Twitch-канала нет в списке."
-	data["twitch"] = [l for l in data["twitch"] if l != login_norm]
-	save_tracking(data)
-	notified = load_notified()
-	notified.get("twitch", {}).pop(login_norm, None)
-	save_notified(notified)
-	return True, f"Twitch-канал удалён: {login_norm}"
+    login_norm = login.strip().lower()
+    data = load_tracking()
+    if login_norm not in data["twitch"]:
+        return False, "Такого Twitch-канала нет в списке."
+    data["twitch"] = [l for l in data["twitch"] if l != login_norm]
+    save_tracking(data)
+    notified = load_notified()
+    notified.get("twitch", {}).pop(login_norm, None)
+    save_notified(notified)
+    return True, f"Twitch-канал удалён: {login_norm}"
 
 def list_twitch_channels():
 	return load_tracking().get("twitch", [])
@@ -956,11 +1099,11 @@ async def add_youtube_channel(channel: str):
 		cid = await _resolve_youtube_channel_id(session, channel)
 	if not cid:
 		return False, "Укажите @handle или ссылку вида https://www.youtube.com/@handle"
-	data = load_tracking()
+	data = await async_load_tracking()
 	if cid in data["youtube"]:
 		return False, "Канал уже добавлен."
 	data["youtube"].append(cid)
-	save_tracking(data)
+	await async_save_tracking(data)
 	return True, f"YouTube-канал добавлен: {cid}"
 
 async def remove_youtube_channel(channel: str):
@@ -971,14 +1114,14 @@ async def remove_youtube_channel(channel: str):
 			cid = await _resolve_youtube_channel_id(session, channel)
 	except Exception:
 		cid = None
-	data = load_tracking()
+	data = await async_load_tracking()
 	target = cid or channel.strip()
 	if target in data["youtube"]:
 		data["youtube"] = [c for c in data["youtube"] if c != target]
-		save_tracking(data)
-		notified = load_notified()
+		await async_save_tracking(data)
+		notified = await async_load_notified()
 		notified.get("youtube", {}).pop(target, None)
-		save_notified(notified)
+		await async_save_notified(notified)
 		return True, f"YouTube-канал удалён: {target}"
 	return False, "Такого YouTube-канала нет в списке."
 

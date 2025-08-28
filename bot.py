@@ -645,3 +645,12 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Критическая ошибка при запуске: {e}")
         traceback.print_exc()
+
+def main():
+    """Entry point для setup.py/pyproject console_scripts."""
+    try:
+        logger.info("🚀 Запуск бота Genesis (entry point)...")
+        bot.run(TOKEN)
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка при запуске: {e}")
+        traceback.print_exc()
