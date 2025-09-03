@@ -396,7 +396,7 @@ async def _process_reaction_remove(payload, bot, roles_data, guild):
 # Forum parsing + notifier (re-send if deleted)
 # --------------------------
 async def parse_forum():
-	timeout = aiohttp.ClientTimeout(total=15)
+	timeout = aiohttp.ClientTimeout(total=30)
 	headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
 	async def fetch_soup(session, url):
@@ -474,7 +474,7 @@ async def parse_forum():
 		return result
 
 async def parse_orders():
-	timeout = aiohttp.ClientTimeout(total=15)
+	timeout = aiohttp.ClientTimeout(total=30)
 	headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
 	async def fetch_soup(session, url):
